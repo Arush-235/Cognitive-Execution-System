@@ -1,0 +1,635 @@
+"""ADHD-aware Psychological Scheduling Engine.
+
+Implements Section 21 of the CES spec:
+- User state inference (energy, focus, momentum, time-of-day)
+- Circadian mapping
+- ADHD-aware task scoring (cognitive load, dopamine, friction, momentum)
+- Rule-based selection (start bias, momentum mode, anti-avoidance, energy matching, dopamine sequencing)
+- Break enforcement
+- Avoidance detection
+"""
+
+from datetime import datetime, timedelta
+from typing import Optional
+
+# ── Circadian Strategy Map ────────────────────────────────────────
+
+CIRCADIAN_MAP = {
+    "morning":   {"ideal_cognitive": "high",   "ideal_friction": "medium", "strategy": "planning_deep_work"},
+    "afternoon": {"ideal_cognitive": "medium",  "ideal_friction": "low",    "strategy": "execution_structured"},
+    "evening":   {"ideal_cognitive": "low",     "ideal_friction": "low",    "strategy": "light_admin_review"},
+    "night":     {"ideal_cognitive": "medium",  "ideal_friction": "low",    "strategy": "creative_low_stakes"},
+}
+
+# ── Numeric maps for scoring ─────────────────────────────────────
+
+COGNITIVE_LEVEL = {"low": 1, "medium": 2, "high": 3}
+FRICTION_LEVEL = {"low": 1, "medium": 2, "high": 3}
+LAYER_WEIGHT = {"strategic": 4.0, "tactical": 3.0, "operational": 2.0, "technical": 1.0}
+ENERGY_LEVEL = {"low": 1, "medium": 2, "high": 3}
+
+
+def infer_time_of_day(now: Optional[datetime] = None) -> str:
+    """Deterministic time-of-day from clock."""
+    h = (now or datetime.now()).hour
+    if 6 <= h < 12:
+        return "morning"
+    elif 12 <= h < 17:
+        return "afternoon"
+    elif 17 <= h < 21:
+        return "evening"
+    else:
+        return "night"
+
+
+def infer_user_state(
+    completed_recently: list[dict],
+    history_events: list[dict],
+    now: Optional[datetime] = None,
+    routine: Optional[dict] = None,
+) -> dict:
+    """Infer the user's current cognitive state from observable signals.
+
+    Returns: {energy, focus, momentum, time_of_day, work_minutes_since_break}
+    """
+    tod = infer_time_of_day(now)
+    current_hour = (now or datetime.now()).hour
+
+    # --- Momentum: based on recent completions ---
+    recent_completions = [
+        e for e in history_events
+        if e.get("event") == "completed"
+    ]
+    completion_count = len(recent_completions)
+
+    if completion_count == 0:
+        momentum = "none"
+    elif completion_count <= 2:
+        momentum = "building"
+    else:
+        momentum = "high"
+
+    # --- Energy: routine-aware circadian model ---
+    if routine and routine.get("has_routine"):
+        energy = _routine_energy(current_hour, routine)
+    else:
+        tod_energy = {"morning": "high", "afternoon": "medium", "evening": "low", "night": "low"}
+        energy = tod_energy[tod]
+
+    # If they just completed a high cognitive task, downgrade energy slightly
+    if recent_completions:
+        last = recent_completions[-1]
+        if last.get("user_energy"):
+            energy = last["user_energy"]  # trust self-reported
+
+    # --- Focus: infer from skip/pause patterns ---
+    recent_skips = sum(1 for e in history_events if e.get("event") == "skipped")
+    recent_pauses = sum(1 for e in history_events if e.get("event") == "paused")
+
+    if recent_skips >= 2 or recent_pauses >= 3:
+        focus = "scattered"
+    elif completion_count >= 2 and recent_skips == 0:
+        focus = "locked_in"
+    else:
+        focus = "normal"
+
+    # --- Work minutes since last break ---
+    work_minutes = _estimate_work_minutes(history_events, now)
+
+    return {
+        "energy": energy,
+        "focus": focus,
+        "momentum": momentum,
+        "time_of_day": tod,
+        "work_minutes_since_break": work_minutes,
+    }
+
+
+def _estimate_work_minutes(events: list[dict], now: Optional[datetime] = None) -> int:
+    """Estimate continuous work minutes from recent events."""
+    if not events:
+        return 0
+
+    now_ts = now or datetime.now()
+    total = 0
+    for e in events:
+        elapsed = e.get("elapsed_seconds", 0) or 0
+        total += elapsed
+    return total // 60
+
+
+def _parse_time(t: str) -> Optional[int]:
+    """Parse HH:MM string to hour. Returns None if invalid."""
+    if not t or ":" not in t:
+        return None
+    try:
+        return int(t.split(":")[0])
+    except (ValueError, IndexError):
+        return None
+
+
+def _routine_energy(current_hour: int, routine: dict) -> str:
+    """Compute energy level based on user's reported daily routine.
+
+    Energy curve logic:
+    - Just woke up (first 1h): medium (warming up)
+    - 1-2h after wake: high (peak morning energy)
+    - Work hours first half: high
+    - Work hours second half: medium (post-lunch dip)
+    - 1h after work ends: low (decompression)
+    - Evening until 2h before sleep: medium (second wind)
+    - 2h before sleep: low (winding down)
+    - After sleep time / before wake: low
+    """
+    wake = _parse_time(routine.get("wake_time", ""))
+    work_start = _parse_time(routine.get("work_start", ""))
+    work_end = _parse_time(routine.get("work_end", ""))
+    sleep = _parse_time(routine.get("sleep_time", ""))
+
+    if wake is None or sleep is None:
+        tod_energy = {"morning": "high", "afternoon": "medium", "evening": "low", "night": "low"}
+        return tod_energy.get(infer_time_of_day(), "medium")
+
+    # Normalize for overnight (sleep < wake handled by wrapping)
+    h = current_hour
+
+    # Before wake or after sleep → low
+    if sleep > wake:
+        if h >= sleep or h < wake:
+            return "low"
+    else:  # stays up past midnight
+        if h >= sleep and h < wake:
+            return "low"
+
+    # First hour after waking → medium (warming up)
+    if wake <= h < wake + 1:
+        return "medium"
+
+    # 1-2h after wake → high (peak)
+    if wake + 1 <= h < wake + 2:
+        return "high"
+
+    # Work hours
+    if work_start is not None and work_end is not None:
+        mid_work = work_start + (work_end - work_start) // 2
+        if work_start <= h < mid_work:
+            return "high"
+        if mid_work <= h < work_end:
+            return "medium"
+        # First hour after work → low (decompression)
+        if work_end <= h < work_end + 1:
+            return "low"
+
+    # 2h before sleep → low
+    if sleep - 2 <= h < sleep:
+        return "low"
+
+    # Evening second wind
+    if work_end and h >= work_end + 1:
+        return "medium"
+
+    return "medium"
+
+
+def needs_break(user_state: dict) -> Optional[dict]:
+    """Check if user needs a break. Returns break suggestion or None."""
+    mins = user_state.get("work_minutes_since_break", 0)
+    if mins >= 60:
+        return {
+            "type": "enforced",
+            "message": "You've been working for over an hour. Take a 10-minute break.",
+            "duration_minutes": 10,
+        }
+    elif mins >= 45:
+        return {
+            "type": "suggested",
+            "message": "Good stretch of focus! A 5-minute break could help.",
+            "duration_minutes": 5,
+        }
+    return None
+
+
+# ── ADHD-Aware Task Scoring ──────────────────────────────────────
+
+def score_task(item: dict, user_state: dict) -> float:
+    """
+    ADHD-aware scoring function per Section 21.5:
+    score = priority_weight + energy_match + dopamine_alignment - friction_penalty + momentum_bonus
+    """
+    # 1. Priority weight (0-4 based on layer)
+    priority_weight = LAYER_WEIGHT.get(item.get("layer", "technical"), 1.0)
+
+    # Boost tasks already marked as next/doing
+    if item.get("status") == "doing":
+        priority_weight += 1.5
+    elif item.get("status") == "next":
+        priority_weight += 0.5
+
+    # 2. Energy match (-2 to +2)
+    energy_match = _compute_energy_match(item, user_state)
+
+    # 3. Dopamine alignment (0-2)
+    dopamine_alignment = _compute_dopamine_alignment(item, user_state)
+
+    # 4. Friction penalty (0-3)
+    friction_penalty = _compute_friction_penalty(item, user_state)
+
+    # 5. Momentum bonus (0-2)
+    momentum_bonus = _compute_momentum_bonus(item, user_state)
+
+    # 6. Avoidance penalty — tasks skipped many times get urgency bump but friction penalty
+    skip_count = item.get("skip_count", 0)
+    avoidance_adj = 0
+    if skip_count >= 3:
+        avoidance_adj = -1.5  # strongly penalized until decomposed
+    elif skip_count >= 2:
+        avoidance_adj = -0.5
+
+    score = priority_weight + energy_match + dopamine_alignment - friction_penalty + momentum_bonus + avoidance_adj
+
+    return round(score, 2)
+
+
+def _compute_energy_match(item: dict, user_state: dict) -> float:
+    """How well the task's energy demand matches user's current energy."""
+    user_energy = ENERGY_LEVEL.get(user_state.get("energy", "medium"), 2)
+    task_energy = ENERGY_LEVEL.get(item.get("energy_required", "medium"), 2)
+    task_cognitive = COGNITIVE_LEVEL.get(item.get("cognitive_load", "medium"), 2)
+
+    # The ideal: task demand ≤ user energy
+    demand = max(task_energy, task_cognitive)  # effective demand
+    diff = user_energy - demand
+
+    if diff >= 0:
+        return 1.0 + (0.5 if diff == 0 else 0)  # perfect match is best
+    else:
+        return diff * 1.5  # penalty for over-demand
+
+
+def _compute_dopamine_alignment(item: dict, user_state: dict) -> float:
+    """Score based on dopamine profile matching current momentum/state."""
+    profile = item.get("dopamine_profile", "neutral")
+    momentum = user_state.get("momentum", "none")
+
+    if momentum == "none":
+        # Need a quick win to start
+        if profile == "quick_reward":
+            return 2.0
+        elif profile == "neutral":
+            return 0.5
+        else:
+            return -0.5  # delayed reward is hard to start with
+    elif momentum == "building":
+        # Transitioning — neutral or quick reward keeps it going
+        if profile == "quick_reward":
+            return 1.5
+        elif profile == "neutral":
+            return 1.0
+        else:
+            return 0.5  # can handle delayed now
+    else:  # high momentum
+        # Can tackle anything, but delayed reward tasks finally viable
+        if profile == "delayed_reward":
+            return 1.5
+        elif profile == "neutral":
+            return 1.0
+        else:
+            return 0.8
+
+
+def _compute_friction_penalty(item: dict, user_state: dict) -> float:
+    """Higher friction = harder to start, especially with low momentum/energy."""
+    friction = FRICTION_LEVEL.get(item.get("initiation_friction", "medium"), 2)
+    momentum = user_state.get("momentum", "none")
+    focus = user_state.get("focus", "normal")
+
+    penalty = friction * 0.5  # base
+
+    # Friction hurts more when momentum is low
+    if momentum == "none":
+        penalty *= 1.5
+    elif momentum == "building":
+        penalty *= 1.0
+    else:
+        penalty *= 0.6  # high momentum overcomes friction
+
+    # Scattered focus makes friction worse
+    if focus == "scattered":
+        penalty *= 1.3
+
+    return round(penalty, 2)
+
+
+def _compute_momentum_bonus(item: dict, user_state: dict) -> float:
+    """Bonus for tasks that maintain/build momentum."""
+    momentum = user_state.get("momentum", "none")
+    duration = item.get("duration_minutes", 30)
+    visibility = item.get("completion_visibility", "visible")
+
+    bonus = 0.0
+
+    # Short tasks build momentum
+    if duration <= 20:
+        bonus += 0.5
+    elif duration <= 30:
+        bonus += 0.25
+
+    # Visible completion boosts dopamine
+    if visibility == "visible":
+        bonus += 0.5
+
+    # When momentum is high, longer/harder tasks become viable
+    if momentum == "high":
+        bonus += 0.5
+
+    return bonus
+
+
+# ── Selection Rules ───────────────────────────────────────────────
+
+def select_next_task(
+    items: list[dict],
+    user_state: dict,
+    completed_clusters: set[str] = None,
+) -> dict:
+    """Apply ADHD scheduling rules to select the best next task.
+
+    Rules (in priority):
+    1. Start Bias: if momentum=none → low friction, quick reward, ≤20 min
+    2. Momentum Mode: if tasks completed → escalate gradually
+    3. Anti-Avoidance: resistance_flag items get deferred unless decomposed
+    4. Energy Matching: enforce task/energy alignment
+    5. Dopamine Sequencing: quick win → meaningful → optional reward
+    6. Thinking Task Rules: max 1 thinking at a time, high energy + morning/peak only
+    7. Dopamine Sandwich: quick win before thinking, execution task after
+
+    Returns: {
+        selected: item,
+        reasoning: str,
+        recovery: optional low-effort task,
+        sequence: [up to 3 upcoming],
+        anti_loop_warning: optional str
+    }
+    """
+    if not items:
+        return {"selected": None, "reasoning": "No tasks available.", "recovery": None, "sequence": []}
+
+    momentum = user_state.get("momentum", "none")
+    energy = user_state.get("energy", "medium")
+    focus = user_state.get("focus", "normal")
+    tod = user_state.get("time_of_day", "afternoon")
+    circadian = CIRCADIAN_MAP.get(tod, CIRCADIAN_MAP["afternoon"])
+
+    # Separate thinking tasks from regular tasks
+    thinking_tasks = [i for i in items if i.get("type") == "thinking"]
+    regular_tasks = [i for i in items if i.get("type") != "thinking"]
+
+    # Anti-loop check: flag thinking tasks revisited too many times
+    anti_loop_warning = None
+    for t in thinking_tasks:
+        if t.get("revisit_count", 0) >= 3:
+            anti_loop_warning = (
+                f"'{t['content']}' has been revisited {t['revisit_count']} times. "
+                f"Consider: force a decision, discard it, or archive for later."
+            )
+
+    # RULE 6: Thinking Task Eligibility
+    # Only offer thinking tasks when: energy=high, morning/afternoon, momentum != none, max 1 at a time
+    thinking_eligible = (
+        energy == "high"
+        and tod in ("morning", "afternoon")
+        and momentum != "none"
+        and focus != "scattered"
+    )
+
+    # Check if a thinking task is already in "doing" status
+    active_thinking = any(
+        i.get("type") == "thinking" and i.get("status") == "doing" for i in items
+    )
+    if active_thinking:
+        thinking_eligible = False
+
+    # Score all items
+    scored = []
+    for item in items:
+        # Skip thinking tasks if not eligible
+        if item.get("type") == "thinking" and not thinking_eligible:
+            continue
+        s = score_task(item, user_state)
+
+        # Thinking task scoring adjustments
+        if item.get("type") == "thinking":
+            # Bonus for peak conditions
+            if tod == "morning" and energy == "high":
+                s += 1.5
+            # Penalty for anti-loop items
+            revisits = item.get("revisit_count", 0)
+            if revisits >= 2:
+                s -= revisits * 0.5
+
+        scored.append((s, item))
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    if not scored:
+        # If we filtered out everything (all thinking, not eligible), fall back
+        scored = [(score_task(i, user_state), i) for i in items]
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+    # RULE 1: Start Bias — when momentum is none, heavily filter
+    if momentum == "none":
+        starters = [
+            (s, i) for s, i in scored
+            if i.get("initiation_friction", "medium") in ("low", "medium")
+            and i.get("duration_minutes", 30) <= 25
+            and not i.get("resistance_flag")
+        ]
+        if starters:
+            scored = starters
+
+    # RULE 3: Anti-Avoidance — skip resistance-flagged items unless they're top priority
+    if scored[0][1].get("resistance_flag") and len(scored) > 1:
+        # Only allow if it's dramatically higher scored
+        if scored[0][0] - scored[1][0] < 2.0:
+            non_resistant = [(s, i) for s, i in scored if not i.get("resistance_flag")]
+            if non_resistant:
+                scored = non_resistant
+
+    # RULE 4: Energy Matching — if user energy is low, cap task demand
+    if energy == "low":
+        low_demand = [
+            (s, i) for s, i in scored
+            if COGNITIVE_LEVEL.get(i.get("cognitive_load", "medium"), 2) <= 2
+            and ENERGY_LEVEL.get(i.get("energy_required", "medium"), 2) <= 2
+        ]
+        if low_demand:
+            scored = low_demand
+
+    selected = scored[0][1] if scored else items[0]
+
+    # Build reasoning
+    reasoning = _build_reasoning(selected, user_state, circadian)
+
+    # Find recovery task (low-effort, different cluster)
+    recovery = _find_recovery_task(items, selected, user_state)
+
+    # Build sequence: up to 3 upcoming (including selected)
+    sequence = [i for _, i in scored[:3]]
+
+    # RULE 7: Dopamine Sandwich for thinking tasks
+    # If selected is a thinking task, prepend a quick win and append an execution task
+    dopamine_sandwich = None
+    if selected.get("type") == "thinking":
+        quick_win = _find_quick_win(regular_tasks, selected)
+        exec_after = _find_execution_followup(regular_tasks, selected)
+        if quick_win or exec_after:
+            dopamine_sandwich = {
+                "before": quick_win,
+                "after": exec_after,
+            }
+            reasoning = "🧠 Thinking task with dopamine sandwich: " + reasoning
+
+    result = {
+        "selected": selected,
+        "reasoning": reasoning,
+        "recovery": recovery,
+        "sequence": sequence,
+    }
+    if anti_loop_warning:
+        result["anti_loop_warning"] = anti_loop_warning
+    if dopamine_sandwich:
+        result["dopamine_sandwich"] = dopamine_sandwich
+    return result
+
+
+def _build_reasoning(task: dict, user_state: dict, circadian: dict) -> str:
+    """Generate human-readable reasoning for why this task was selected."""
+    parts = []
+    momentum = user_state.get("momentum", "none")
+    energy = user_state.get("energy", "medium")
+    tod = user_state.get("time_of_day", "afternoon")
+
+    # Momentum context
+    if momentum == "none":
+        parts.append(f"Starting with a low-friction task to build momentum")
+    elif momentum == "building":
+        parts.append(f"Momentum building — stepping up to a meatier task")
+    else:
+        parts.append(f"Strong momentum — tackling a high-impact task")
+
+    # Energy context
+    task_load = task.get("cognitive_load", "medium")
+    if energy == "low" and task_load == "low":
+        parts.append(f"matched to your current energy level")
+    elif energy == "high" and task_load == "high":
+        parts.append(f"great time for deep work while energy is high")
+
+    # Dopamine context
+    dp = task.get("dopamine_profile", "neutral")
+    if dp == "quick_reward":
+        parts.append(f"quick visible progress to fuel your drive")
+    elif dp == "delayed_reward" and momentum == "high":
+        parts.append(f"you have the momentum to tackle something meaningful")
+
+    # Duration context
+    dur = task.get("duration_minutes", 30)
+    if dur <= 15:
+        parts.append(f"just {dur} minutes")
+
+    cluster = task.get("cluster", "")
+    result = ". ".join(parts) + "."
+    if cluster:
+        result = f"[{cluster}] " + result
+
+    return result
+
+
+def _find_recovery_task(
+    items: list[dict],
+    selected: dict,
+    user_state: dict,
+) -> Optional[dict]:
+    """Find a low-effort recovery task from a different cluster."""
+    sel_cluster = selected.get("cluster", "")
+    candidates = [
+        i for i in items
+        if i["id"] != selected["id"]
+        and i.get("cognitive_load", "medium") == "low"
+        and i.get("initiation_friction", "medium") == "low"
+        and i.get("duration_minutes", 30) <= 15
+        and i.get("cluster", "") != sel_cluster
+    ]
+    if candidates:
+        return candidates[0]
+    # Fallback: any low-effort task
+    fallback = [
+        i for i in items
+        if i["id"] != selected["id"]
+        and i.get("cognitive_load", "medium") == "low"
+        and i.get("duration_minutes", 30) <= 20
+    ]
+    return fallback[0] if fallback else None
+
+
+# ── Avoidance Handling ────────────────────────────────────────────
+
+def handle_skip(item: dict) -> dict:
+    """Process a skipped task and return updated fields + guidance.
+
+    Rules:
+    - skip_count increments
+    - If skip_count >= 2: set resistance_flag
+    - If resistance_flag: suggest decomposition or friction reduction
+    """
+    skip_count = item.get("skip_count", 0) + 1
+    resistance = item.get("resistance_flag", False) or (skip_count >= 2)
+
+    result = {
+        "skip_count": skip_count,
+        "resistance_flag": resistance,
+    }
+
+    if resistance:
+        result["guidance"] = "avoidance_detected"
+        if item.get("type") == "thinking":
+            result["suggestion"] = (
+                f"You've skipped this thinking task {skip_count} times. "
+                f"Try a reduced version: 15 min, just write 3 bullet points. "
+                f"Or discard it if it's no longer relevant."
+            )
+            result["reduce_scope"] = True
+        else:
+            result["suggestion"] = (
+                f"You've skipped this {skip_count} times. "
+                f"Consider: break it into a 10-min starter step, "
+                f"or change when/how you'd approach it."
+            )
+    elif skip_count == 1:
+        result["guidance"] = "normal_skip"
+        result["suggestion"] = None
+
+    return result
+
+
+def _find_quick_win(regular_tasks: list[dict], exclude: dict) -> Optional[dict]:
+    """Find a quick-win task for dopamine sandwich (before a thinking task)."""
+    candidates = [
+        i for i in regular_tasks
+        if i["id"] != exclude["id"]
+        and i.get("duration_minutes", 30) <= 15
+        and i.get("dopamine_profile") == "quick_reward"
+        and i.get("initiation_friction", "medium") == "low"
+        and i.get("status") in ("next", "inbox")
+    ]
+    return candidates[0] if candidates else None
+
+
+def _find_execution_followup(regular_tasks: list[dict], exclude: dict) -> Optional[dict]:
+    """Find a concrete execution task to do after a thinking task (dopamine reward)."""
+    candidates = [
+        i for i in regular_tasks
+        if i["id"] != exclude["id"]
+        and i.get("completion_visibility") == "visible"
+        and i.get("cognitive_load", "medium") in ("low", "medium")
+        and i.get("status") in ("next", "inbox")
+    ]
+    return candidates[0] if candidates else None

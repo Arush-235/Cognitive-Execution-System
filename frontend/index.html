@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, interactive-widget=resizes-content">
+    <meta name="theme-color" content="#C61919">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <title>CES</title>
+    <link rel="manifest" href="/manifest.json">
+    <link rel="icon" href="/icon-192.png" type="image/png">
+    <link rel="apple-touch-icon" href="/icon-192.png">
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <div id="app">
+        <!-- NAV -->
+        <nav id="nav">
+            <button class="nav-btn active" data-view="input">Capture</button>
+            <button class="nav-btn" data-view="execute">Execute</button>
+            <button class="nav-btn" data-view="plan">Plan</button>
+            <button class="nav-btn" data-view="wishes">Wishes</button>
+        </nav>
+
+        <!-- TRACK SELECTOR BAR -->
+        <div id="track-bar" class="track-bar">
+            <div id="track-pills" class="track-pills"></div>
+            <button id="btn-settings" class="btn-settings" aria-label="Settings">⚙️</button>
+        </div>
+
+        <!-- INPUT VIEW -->
+        <div id="view-input" class="view active">
+            <div class="input-area">
+                <textarea id="text-input" placeholder="What's on your mind?" rows="6"></textarea>
+                <div class="input-actions">
+                    <button id="btn-send" class="btn-primary">Send</button>
+                    <button id="btn-mic" class="btn-mic">🎙️</button>
+                </div>
+                <div id="mic-status" class="mic-status hidden"></div>
+            </div>
+            <div id="ingest-result" class="result-card hidden"></div>
+
+            <!-- Pending approvals -->
+            <div id="pending-section" class="hidden">
+                <h3>Needs Your Approval</h3>
+                <div id="pending-list"></div>
+            </div>
+        </div>
+
+        <!-- EXECUTE VIEW -->
+        <div id="view-execute" class="view">
+            <!-- State 1: Nothing queued -->
+            <div id="exec-empty" class="empty-state">
+                <p>No active task</p>
+                <button id="btn-whats-next" class="btn-primary">What's Next?</button>
+            </div>
+
+            <!-- State 2: Choose from top 3 options -->
+            <div id="exec-choose" class="hidden">
+                <div id="big-picture" class="big-picture hidden"></div>
+                <div class="choose-label">PICK YOUR TASK</div>
+                <div id="options-list" class="options-list"></div>
+            </div>
+
+            <!-- State 3: Task loaded, ready to start -->
+            <div id="exec-ready" class="hidden">
+                <div class="ready-card">
+                    <div class="ready-label">READY</div>
+                    <div id="ready-content" class="ready-content"></div>
+                    <div id="ready-meta" class="ready-meta"></div>
+                    <div id="ready-why" class="ready-why"></div>
+                    <div class="ready-actions">
+                        <button id="btn-start-timer" class="btn-start">▶ Start</button>
+                        <button id="btn-skip" class="btn-skip">Skip</button>
+                        <button id="btn-back-to-choose" class="btn-skip">← Back</button>
+                    </div>
+                </div>
+                <div class="after-section">
+                    <div class="after-label">AFTER</div>
+                    <div id="after-list"></div>
+                </div>
+            </div>
+
+            <!-- State 3: Timer running — focused mode -->
+            <div id="exec-timer" class="hidden">
+                <div class="timer-screen">
+                    <div class="timer-task-label">FOCUS</div>
+                    <div id="timer-content" class="timer-content"></div>
+                    <div class="timer-ring-wrap">
+                        <svg class="timer-ring" viewBox="0 0 200 200">
+                            <circle class="timer-ring-bg" cx="100" cy="100" r="90" />
+                            <circle id="timer-ring-progress" class="timer-ring-progress" cx="100" cy="100" r="90" />
+                        </svg>
+                        <div class="timer-digits-wrap">
+                            <div id="timer-digits" class="timer-digits">00:00</div>
+                            <div id="timer-phase" class="timer-phase"></div>
+                        </div>
+                    </div>
+                    <div class="timer-actions">
+                        <button id="btn-timer-done" class="btn-complete">✓ Done</button>
+                        <button id="btn-timer-pause" class="btn-pause">⏸</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- PLAN VIEW -->
+        <div id="view-plan" class="view">
+            <div id="plan-content"></div>
+        </div>
+
+        <!-- WISHES VIEW -->
+        <div id="view-wishes" class="view">
+            <div class="wishes-header">
+                <h2>🌟 Wishful Thinking</h2>
+                <p>Dreams, bucket list, someday-maybe ideas</p>
+            </div>
+            <div id="wishes-content"></div>
+        </div>
+
+        <!-- Skip Modal -->
+        <div id="skip-modal" class="modal hidden">
+            <div class="modal-content">
+                <h3>Why skip?</h3>
+                <textarea id="skip-reason" placeholder="Quick reason..." rows="2"></textarea>
+                <div class="modal-actions">
+                    <button id="btn-skip-confirm" class="btn-primary">Skip</button>
+                    <button id="btn-skip-cancel" class="btn-secondary">Cancel</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Weekly Stats Popup -->
+        <div id="stats-popup" class="stats-popup hidden">
+            <div class="stats-popup-card">
+                <button id="stats-popup-close" class="stats-popup-close">&times;</button>
+                <div class="stats-hero">
+                    <div class="stats-hero-icon">⚡</div>
+                    <div id="stats-hero-number" class="stats-hero-number">0</div>
+                    <div class="stats-hero-unit">minutes saved this week</div>
+                </div>
+                <div id="stats-details" class="stats-details"></div>
+                <div id="stats-persona" class="stats-persona hidden"></div>
+                <button id="stats-popup-minimize" class="stats-minimize-btn">Got it!</button>
+            </div>
+        </div>
+
+        <!-- Onboarding Overlay -->
+        <div id="onboarding" class="onboarding hidden">
+            <div class="onboarding-card">
+                <!-- Step 1: Welcome + Routine question -->
+                <div id="onb-step-1" class="onb-step">
+                    <div class="onb-icon">🧠</div>
+                    <h2>Welcome to CES</h2>
+                    <p class="onb-desc">Your Cognitive Execution System. Let's personalize your experience.</p>
+                    <p class="onb-question">Do you have a fixed daily routine?</p>
+                    <div class="onb-choice-row">
+                        <button id="onb-routine-yes" class="onb-choice-btn">Yes, mostly</button>
+                        <button id="onb-routine-no" class="onb-choice-btn onb-choice-alt">No, it varies</button>
+                    </div>
+                </div>
+                <!-- Step 2: Time inputs (shown only if routine = yes) -->
+                <div id="onb-step-2" class="onb-step hidden">
+                    <div class="onb-icon">⏰</div>
+                    <h2>Your Schedule</h2>
+                    <p class="onb-desc">This helps us match tasks to your energy levels.</p>
+                    <div class="onb-fields">
+                        <label class="onb-field">
+                            <span>Wake up</span>
+                            <input type="time" id="onb-wake" value="07:00">
+                        </label>
+                        <label class="onb-field">
+                            <span>Work starts</span>
+                            <input type="time" id="onb-work-start" value="09:00">
+                        </label>
+                        <label class="onb-field">
+                            <span>Work ends</span>
+                            <input type="time" id="onb-work-end" value="17:00">
+                        </label>
+                        <label class="onb-field">
+                            <span>Bedtime</span>
+                            <input type="time" id="onb-sleep" value="23:00">
+                        </label>
+                    </div>
+                    <button id="onb-submit" class="btn-primary onb-submit">Let's go →</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Settings Modal -->
+        <div id="settings-modal" class="modal hidden">
+            <div class="modal-content settings-modal-content">
+                <h3>Settings</h3>
+                <div class="settings-fields">
+                    <label class="settings-field">
+                        <span>OpenAI Model</span>
+                        <select id="settings-model">
+                            <option value="gpt-5.3">gpt-5.3</option>
+                            <option value="gpt-5.3-mini">gpt-5.3-mini</option>
+                            <option value="o3">o3</option>
+                            <option value="o4-mini">o4-mini</option>
+                            <option value="gpt-4.1">gpt-4.1</option>
+                            <option value="gpt-4.1-mini">gpt-4.1-mini</option>
+                            <option value="gpt-4.1-nano">gpt-4.1-nano</option>
+                            <option value="gpt-4o">gpt-4o</option>
+                            <option value="gpt-4o-mini">gpt-4o-mini</option>
+                        </select>
+                    </label>
+                    <label class="settings-field">
+                        <span>OpenAI API Key</span>
+                        <input type="password" id="settings-apikey" placeholder="sk-...">
+                    </label>
+                </div>
+                <div class="modal-actions">
+                    <button id="btn-settings-save" class="btn-primary">Save</button>
+                    <button id="btn-settings-cancel" class="btn-secondary">Cancel</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Toast -->
+        <div id="toast" class="toast hidden"></div>
+    </div>
+
+    <script src="/app.js"></script>
+</body>
+</html>

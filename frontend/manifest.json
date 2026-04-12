@@ -1,0 +1,13 @@
+{
+    "name": "CES",
+    "short_name": "CES",
+    "description": "Cognitive Execution System",
+    "start_url": "/",
+    "display": "standalone",
+    "background_color": "#ffffff",
+    "theme_color": "#C61919",
+    "icons": [
+        { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png" },
+        { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png" }
+    ]
+}

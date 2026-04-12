@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+backend/__pycache__/
+*.pyc
+ces.db
+ces.db-shm
+ces.db-wal
+.env
+.DS_Store
+theme.md
+test_comprehensive.py
+test_models.py
