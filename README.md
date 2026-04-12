@@ -96,7 +96,8 @@ CES addresses each of these by:
 │  └─────────────────────────────────────────────────┘  │
 │                                                      │
 │  ┌─────────────────────────────────────────────────┐  │
-│  │            OpenAI API (GPT-4o-mini)             │  │
+│  │     OpenAI API (configurable model, default      │  │
+│  │              GPT-4o-mini)                        │  │
 │  │  - Task decomposition & classification          │  │
 │  │  - Execution planning                           │  │
 │  │  - Thinking task expansion                      │  │
@@ -111,7 +112,7 @@ CES addresses each of these by:
 TaskKar/
 ├── run.py                 # Uvicorn server entry point
 ├── requirements.txt       # Python dependencies
-├── .env                   # OpenAI API key
+├── .env                   # OPENAI_API_KEY + OPENAI_MODEL (configurable)
 ├── backend/
 │   ├── __init__.py
 │   ├── app.py             # FastAPI app — all API endpoints + helpers
@@ -139,7 +140,7 @@ TaskKar/
 |---|---|---|
 | **Backend** | Python 3.11+ / FastAPI | Async, fast, typed, minimal boilerplate |
 | **Database** | SQLite + aiosqlite | Zero config, WAL mode for concurrent reads, portable |
-| **AI** | OpenAI GPT-4o-mini | Cost-effective, fast, sufficient for task decomposition |
+| **AI** | OpenAI (configurable, default GPT-4o-mini) | Supports multiple models including reasoning models (o3, o4-mini); selectable via Settings or `.env` |
 | **Speech** | OpenAI Whisper | Accurate audio transcription for voice capture |
 | **Frontend** | Vanilla JS/HTML/CSS | No build step, instant load, PWA-ready |
 | **Server** | Uvicorn | ASGI server with hot reload |
@@ -153,9 +154,8 @@ uvicorn>=0.25
 python-multipart>=0.0.6
 openai>=1.0
 aiosqlite>=0.19
+python-dotenv>=1.0
 ```
-
-Runtime also uses `python-dotenv` for `.env` loading.
 
 ---
 
@@ -296,12 +296,12 @@ Keys: `current_active_task_id`, `last_plan_version`, `last_cluster_updated`, `ac
 
 ## 5. AI Pipelines
 
-CES uses three distinct AI pipelines, all powered by GPT-4o-mini.
+CES uses three distinct AI pipelines, all powered by a **configurable model** (default GPT-4o-mini, selectable via Settings or `OPENAI_MODEL` in `.env`). Reasoning models (o3, o4-mini, o3-mini, o1, o1-mini) are automatically handled with adjusted API parameters (no `temperature`, uses `max_completion_tokens` instead of `max_tokens`).
 
 ### 5.1 Task Decomposition & Classification (Parser)
 
 **File**: `backend/ai.py` — `parse_input()`  
-**Model**: GPT-4o-mini, temperature 0.2  
+**Model**: Configurable (default GPT-4o-mini), temperature 0.2  
 **Input**: Raw user text + existing context (goals, tasks, tracks, persona)  
 **Output**: Structured JSON with goal + array of classified tasks
 
@@ -355,7 +355,7 @@ If a **user work-speed profile** exists (from completed tasks), it's injected in
 #### Context Injection
 
 Before parsing, the system builds a rich context string containing:
-- All available tracks (id, name, icon)
+- All available tracks (id, name, icon, `time_available`, `allow_cross_track` constraints)
 - Active goals (id, cluster, summary)
 - All non-done items grouped by cluster (with parent/goal links)
 - Recently completed items (for continuity)
@@ -367,10 +367,21 @@ This lets the AI:
 - Set `existing_goal_id` to avoid creating duplicate goals
 - Assign the correct `track_id` based on domain matching
 
+#### Multilingual Input Support
+
+All three AI prompts (parser, planner, expansion) accept input in **English, Hindi, or Hinglish** (Hindi-English mix). Output is always in **English** regardless of input language. Technical terms, proper nouns, and brand names are preserved as-is.
+
+#### Model Compatibility Layer
+
+`_chat_kwargs()` in `ai.py` automatically builds the correct API parameters based on the active model:
+- **Standard models** (GPT-4o, GPT-4o-mini, etc.): Uses `temperature` + `max_tokens`
+- **Reasoning models** (o3, o4-mini, o3-mini, o1, o1-mini): Uses `max_completion_tokens` only (no temperature)
+- All calls include `response_format: {"type": "json_object"}` to enforce structured output
+
 ### 5.2 Execution Planning (Planner)
 
 **File**: `backend/ai.py` — `generate_plan()`  
-**Model**: GPT-4o-mini, temperature 0.3  
+**Model**: Configurable (default GPT-4o-mini), temperature 0.3  
 **Input**: Active items + completed recently + goal context  
 **Output**: `{now, next, later, reasoning, big_picture}`
 
@@ -385,7 +396,7 @@ The planner decides what to work on RIGHT NOW by evaluating:
 ### 5.3 Thinking Task Expansion
 
 **File**: `backend/ai.py` — `expand_thinking_output()`  
-**Model**: GPT-4o-mini, temperature 0.2  
+**Model**: Configurable (default GPT-4o-mini), temperature 0.2  
 **Input**: Original thinking task + user's notes + existing context  
 **Output**: Array of concrete action tasks + gaps
 
@@ -397,6 +408,48 @@ This pipeline converts the output of a completed "thinking session" into executa
 **Model**: Whisper-1  
 **Input**: Audio blob (webm/ogg/mp4)  
 **Output**: Transcribed text → fed into the parser pipeline
+
+### 5.5 Task Deduplication (Two-Layer)
+
+CES implements a **two-layer deduplication system** to prevent accidental duplicate task creation:
+
+**Layer 1 — Raw Input Dedup (5-minute cache)**
+- Normalizes raw input text (lowercase, collapse whitespace, strip punctuation)
+- Maintains an in-memory cache mapping normalized text → timestamp
+- Rejects identical submissions within a 5-minute window
+- Cache entries auto-expire after 5 minutes
+
+**Layer 2 — Per-Task Content Dedup (database check)**
+- Before inserting each parsed task, normalizes its content
+- Compares against all active (non-done, non-wishful) items in the database
+- If a match is found, the duplicate task is silently skipped
+- Prevents duplicates even when the same task appears across different brain dumps
+
+Both layers use the same `_normalize_content()` function: lowercase, collapse whitespace, strip punctuation.
+
+### 5.6 Error Handling Strategy
+
+All AI calls are wrapped in try/except blocks with graceful degradation:
+
+| Layer | Error Handling |
+|---|---|
+| `ai.py` — `generate_plan()` | Returns empty plan on failure, logs error |
+| `ai.py` — `expand_thinking_output()` | Returns empty tasks array on failure |
+| `ai.py` — `transcribe_audio()` | Returns empty string on failure |
+| `ai.py` — JSON parsing | Falls back to `{}` on `JSONDecodeError` |
+| `planner.py` — replan calls | Guarded; failures don't block ingestion |
+| `app.py` — all endpoints | AI/replan failures logged, non-fatal to user flow |
+
+The design principle: **AI failures should never crash the user's flow**. If the planner fails, tasks are still ingested. If expansion fails, the user keeps their thinking output.
+
+### 5.7 Planner Context Enrichment
+
+The planner (`backend/planner.py`) enriches `generate_plan()` calls with full context:
+
+- **`completed_recently`**: Tasks completed in the last 48 hours (id, content, cluster, track_id) — gives the AI continuity about recent work
+- **`goal_context`**: Active goals formatted as "id: summary (cluster)" — aligns planning with big-picture objectives
+
+Both `run_full_replan()` and `run_partial_replan()` fetch this context via helper functions `_get_recently_completed()` and `_get_goal_context()` before calling the AI planner.
 
 ---
 
@@ -740,9 +793,17 @@ Tracks are **focus lanes** — life domains that help the user compartmentalize 
 
 | Track | Color | Icon | Cross-Track | Time |
 |---|---|---|---|---|
-| Work | #4f9eff (blue) | 💼 | No | 09:00-17:00 |
+| Work | #BF2020 (red) | 💼 | No | 09:00-17:00 |
 | Personal | #a78bfa (purple) | 🏠 | Yes (shows untracked) | — |
-| Errands | #fb923c (orange) | 🛒 | No | 08:00-21:00 |
+| Errands | #f59e0b (amber) | 🛒 | No | 08:00-21:00 |
+
+#### Track Assignment Rules (from AI prompt)
+
+The parser uses explicit rules to assign tasks to tracks:
+- **Errands**: Physical-world tasks — shopping, organizing desk, cleaning, watering plants, picking up items, running errands
+- **Work**: Job/professional tasks — coding, meetings, emails, invoicing, client work
+- **Personal**: Digital projects, hobbies, personal growth, learning, creative pursuits
+- The key distinction: if a task requires **physically going somewhere or handling physical objects** in a non-work context, it's Errands — otherwise, hobby/growth/digital tasks are Personal
 
 ### 11.3 How Tracks Work
 
@@ -907,6 +968,32 @@ User fills form
 |---|---|---|
 | `/stats/weekly` | GET | Weekly stats, complexity, improvement, persona |
 
+### Settings
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/settings` | GET | Get current model name + masked API key |
+| `/settings` | POST | Update model and/or API key (persisted to `.env`) |
+
+**GET /settings**
+```json
+{
+  "model": "gpt-4o-mini",
+  "api_key_masked": "sk-ab...xYz1"
+}
+```
+
+**POST /settings**
+```json
+// Request (both fields optional)
+{ "model": "o4-mini", "api_key": "sk-..." }
+
+// Response
+{ "status": "ok", "model": "o4-mini" }
+```
+
+Allowed models: `gpt-5.3`, `gpt-5.3-mini`, `o4-mini`, `o3`, `gpt-4.1`, `gpt-4.1-mini`, `gpt-4.1-nano`, `gpt-4o`, `gpt-4o-mini`. Invalid models return HTTP 400. API key format is validated (`sk-` prefix + 20+ alphanumeric chars). Changes are written to `.env` and applied immediately to the live environment.
+
 **GET /stats/weekly**
 ```json
 {
@@ -944,6 +1031,7 @@ The app has four main screens accessible via the bottom navigation bar:
 - Voice recording button (MediaRecorder API → Whisper)
 - Ingest result card (auto-hides after 4s)
 - Pending approvals section
+- **Settings gear icon** (⚙️ in header) — opens a popup to configure AI model and API key
 
 **Execute Screen** (`#view-execute`) — Four sub-states:
 1. **Empty** — No tasks queued. "What's Next?" button. If wishful items exist, a random one is suggested with a "Promote & Do It" button
@@ -1113,6 +1201,7 @@ Build Context Summary                  Build Context Summary
     │                                          │
     ▼                                          ▼
 GPT-4o-mini Parser ◀─────────────────────────────
+(or configured model)
     │
     ▼
 {goal, tasks[{content, layer, type, cognitive_load, dopamine_profile,
@@ -1122,6 +1211,9 @@ GPT-4o-mini Parser ◀───────────────────�
 Approval Gate ──needs approval──▶ Inbox (pending)
     │ auto-approved                     │
     ▼                             [User approves]
+Dedup Check (per-task content)         │
+    │                                  ▼
+    ▼                           Dedup Check
 Insert Tasks to DB                     │
     │                                  ▼
     ▼                           Insert Tasks to DB
@@ -1413,7 +1505,7 @@ No custom web fonts loaded — ensures instant text rendering and matches OS con
 }
 ```
 
-Installable as a standalone app on mobile and desktop. White background with red brand theme for the status bar.
+Installable as a standalone app on mobile and desktop. White background with red brand theme for the status bar. App icons feature a **red (#C61919) circle with a brain emoji (🧠)** extracted from the Apple Color Emoji font.
 
 ### 20.2 Service Worker Strategy
 
@@ -1433,7 +1525,8 @@ API paths that bypass the cache: `/ingest`, `/approve`, `/next`, `/complete`, `/
 
 | Variable | Required | Description |
 |---|---|---|
-| `OPENAI_API_KEY` | Yes | OpenAI API key for GPT-4o-mini and Whisper |
+| `OPENAI_API_KEY` | Yes | OpenAI API key for AI pipelines and Whisper |
+| `OPENAI_MODEL` | No | AI model to use (default: `gpt-4o-mini`). Allowed: `gpt-5.3`, `gpt-5.3-mini`, `o4-mini`, `o3`, `gpt-4.1`, `gpt-4.1-mini`, `gpt-4.1-nano`, `gpt-4o`, `gpt-4o-mini` |
 | `CES_DB_PATH` | No | SQLite database path (default: `ces.db`) |
 
 Set in `.env` file (loaded by `python-dotenv`).
@@ -1447,11 +1540,10 @@ source .venv/bin/activate
 
 # Install dependencies
 pip install -r requirements.txt
-pip install python-dotenv
 
 # Set up environment
 cp .env.example .env
-# Edit .env with your OPENAI_API_KEY
+# Edit .env with your OPENAI_API_KEY (and optionally OPENAI_MODEL)
 
 # Run
 python run.py
