@@ -4,3 +4,4 @@ python-multipart>=0.0.6
 openai>=1.0
 aiosqlite>=0.19
 python-dotenv>=1.0
+google-genai>=1.0

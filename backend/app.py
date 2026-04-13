@@ -114,6 +114,7 @@ class OnboardingInput(BaseModel):
 class SettingsInput(BaseModel):
     model: Optional[str] = None
     api_key: Optional[str] = None
+    gemini_api_key: Optional[str] = None
 
 
 # ── Onboarding ───────────────────────────────────────────────────
@@ -172,18 +173,23 @@ _ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 
 # Allowed models (whitelist to prevent injection)
 _ALLOWED_MODELS = {
+    # OpenAI models
     "gpt-5.3", "gpt-5.3-mini",
     "o4-mini", "o3",
     "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano",
     "gpt-4o", "gpt-4o-mini",
+    # Gemini models
+    "gemini-2.5-pro", "gemini-2.5-flash",
+    "gemini-2.0-flash", "gemini-2.0-flash-lite",
 }
 
 
 @app.get("/settings")
 async def get_settings():
-    """Return current model and masked API key."""
+    """Return current model and masked API keys."""
     model = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
     api_key = os.environ.get("OPENAI_API_KEY", "")
+    gemini_key = os.environ.get("GEMINI_API_KEY", "")
     # Mask API key: show first 5 and last 4 chars
     if len(api_key) > 12:
         masked = api_key[:5] + "..." + api_key[-4:]
@@ -191,12 +197,19 @@ async def get_settings():
         masked = api_key[:3] + "..."
     else:
         masked = ""
-    return {"model": model, "api_key_masked": masked}
+    # Mask Gemini key
+    if len(gemini_key) > 12:
+        gemini_masked = gemini_key[:5] + "..." + gemini_key[-4:]
+    elif gemini_key:
+        gemini_masked = gemini_key[:3] + "..."
+    else:
+        gemini_masked = ""
+    return {"model": model, "api_key_masked": masked, "gemini_api_key_masked": gemini_masked}
 
 
 @app.post("/settings")
 async def update_settings(body: SettingsInput):
-    """Update model and/or API key in .env and live environment."""
+    """Update model and/or API keys in .env and live environment."""
     if body.model is not None:
         if body.model not in _ALLOWED_MODELS:
             raise HTTPException(400, f"Invalid model. Allowed: {', '.join(sorted(_ALLOWED_MODELS))}")
@@ -207,11 +220,20 @@ async def update_settings(body: SettingsInput):
         key = body.api_key.strip()
         if not key:
             raise HTTPException(400, "API key cannot be empty")
-        # Basic format validation
+        # Basic format validation for OpenAI keys
         if not re.match(r'^sk-[A-Za-z0-9_-]{20,}$', key):
-            raise HTTPException(400, "Invalid API key format")
+            raise HTTPException(400, "Invalid OpenAI API key format")
         os.environ["OPENAI_API_KEY"] = key
         set_key(str(_ENV_PATH), "OPENAI_API_KEY", key)
+
+    if body.gemini_api_key is not None:
+        key = body.gemini_api_key.strip()
+        if not key:
+            raise HTTPException(400, "Gemini API key cannot be empty")
+        if not re.match(r'^[A-Za-z0-9_-]{20,}$', key):
+            raise HTTPException(400, "Invalid Gemini API key format")
+        os.environ["GEMINI_API_KEY"] = key
+        set_key(str(_ENV_PATH), "GEMINI_API_KEY", key)
 
     return {"status": "ok", "model": os.environ.get("OPENAI_MODEL", "gpt-4o-mini")}
 

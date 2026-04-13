@@ -112,7 +112,7 @@ CES addresses each of these by:
 TaskKar/
 ├── run.py                 # Uvicorn server entry point
 ├── requirements.txt       # Python dependencies
-├── .env                   # OPENAI_API_KEY + OPENAI_MODEL (configurable)
+├── .env                   # API keys (OPENAI_API_KEY, GEMINI_API_KEY) + OPENAI_MODEL
 ├── backend/
 │   ├── __init__.py
 │   ├── app.py             # FastAPI app — all API endpoints + helpers
@@ -140,7 +140,7 @@ TaskKar/
 |---|---|---|
 | **Backend** | Python 3.11+ / FastAPI | Async, fast, typed, minimal boilerplate |
 | **Database** | SQLite + aiosqlite | Zero config, WAL mode for concurrent reads, portable |
-| **AI** | OpenAI (configurable, default GPT-4o-mini) | Supports multiple models including reasoning models (o3, o4-mini); selectable via Settings or `.env` |
+| **AI** | OpenAI + Google Gemini (configurable) | Multi-provider: OpenAI models (GPT-4o-mini default, reasoning models) and Gemini models (2.5-pro, 2.5-flash, etc.); selectable via Settings or `.env` |
 | **Speech** | OpenAI Whisper | Accurate audio transcription for voice capture |
 | **Frontend** | Vanilla JS/HTML/CSS | No build step, instant load, PWA-ready |
 | **Server** | Uvicorn | ASGI server with hot reload |
@@ -155,6 +155,7 @@ python-multipart>=0.0.6
 openai>=1.0
 aiosqlite>=0.19
 python-dotenv>=1.0
+google-genai>=1.0
 ```
 
 ---
@@ -296,7 +297,7 @@ Keys: `current_active_task_id`, `last_plan_version`, `last_cluster_updated`, `ac
 
 ## 5. AI Pipelines
 
-CES uses three distinct AI pipelines, all powered by a **configurable model** (default GPT-4o-mini, selectable via Settings or `OPENAI_MODEL` in `.env`). Reasoning models (o3, o4-mini, o3-mini, o1, o1-mini) are automatically handled with adjusted API parameters (no `temperature`, uses `max_completion_tokens` instead of `max_tokens`).
+CES uses three distinct AI pipelines, powered by a **configurable model** (default GPT-4o-mini, selectable via Settings or `OPENAI_MODEL` in `.env`). Supports both **OpenAI** and **Google Gemini** providers — the provider is auto-detected from the model name prefix (`gemini-*` → Gemini, everything else → OpenAI). OpenAI reasoning models (o3, o4-mini, o3-mini, o1, o1-mini) are automatically handled with adjusted API parameters.
 
 ### 5.1 Task Decomposition & Classification (Parser)
 
@@ -373,10 +374,20 @@ All three AI prompts (parser, planner, expansion) accept input in **English, Hin
 
 #### Model Compatibility Layer
 
-`_chat_kwargs()` in `ai.py` automatically builds the correct API parameters based on the active model:
+`_chat_completion()` in `ai.py` is a unified async function that routes to the correct provider:
+
+**OpenAI path** (via `_chat_kwargs()`):
 - **Standard models** (GPT-4o, GPT-4o-mini, etc.): Uses `temperature` + `max_tokens`
 - **Reasoning models** (o3, o4-mini, o3-mini, o1, o1-mini): Uses `max_completion_tokens` only (no temperature)
 - All calls include `response_format: {"type": "json_object"}` to enforce structured output
+
+**Gemini path** (via `_gemini_config()`):
+- Uses `google.genai` SDK with async client (`client.aio.models.generate_content`)
+- System instructions passed via `systemInstruction` config field
+- JSON output enforced via `responseMimeType: "application/json"`
+- OpenAI-style messages are automatically converted to Gemini's `Content`/`Part` format
+
+**Audio transcription** always uses OpenAI Whisper (requires `OPENAI_API_KEY` regardless of AI model choice).
 
 ### 5.2 Execution Planning (Planner)
 
@@ -972,27 +983,32 @@ User fills form
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/settings` | GET | Get current model name + masked API key |
-| `/settings` | POST | Update model and/or API key (persisted to `.env`) |
+| `/settings` | GET | Get current model name + masked API keys |
+| `/settings` | POST | Update model and/or API keys (persisted to `.env`) |
 
 **GET /settings**
 ```json
 {
   "model": "gpt-4o-mini",
-  "api_key_masked": "sk-ab...xYz1"
+  "api_key_masked": "sk-ab...xYz1",
+  "gemini_api_key_masked": "AIza...xYz1"
 }
 ```
 
 **POST /settings**
 ```json
-// Request (both fields optional)
-{ "model": "o4-mini", "api_key": "sk-..." }
+// Request (all fields optional)
+{ "model": "gemini-2.5-flash", "api_key": "sk-...", "gemini_api_key": "AIza..." }
 
 // Response
-{ "status": "ok", "model": "o4-mini" }
+{ "status": "ok", "model": "gemini-2.5-flash" }
 ```
 
-Allowed models: `gpt-5.3`, `gpt-5.3-mini`, `o4-mini`, `o3`, `gpt-4.1`, `gpt-4.1-mini`, `gpt-4.1-nano`, `gpt-4o`, `gpt-4o-mini`. Invalid models return HTTP 400. API key format is validated (`sk-` prefix + 20+ alphanumeric chars). Changes are written to `.env` and applied immediately to the live environment.
+Allowed models:
+- **OpenAI**: `gpt-5.3`, `gpt-5.3-mini`, `o4-mini`, `o3`, `gpt-4.1`, `gpt-4.1-mini`, `gpt-4.1-nano`, `gpt-4o`, `gpt-4o-mini`
+- **Gemini**: `gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-2.0-flash`, `gemini-2.0-flash-lite`
+
+Invalid models return HTTP 400. OpenAI key format validated (`sk-` prefix), Gemini key format validated (20+ alphanumeric chars). Changes are written to `.env` and applied immediately.
 
 **GET /stats/weekly**
 ```json
@@ -1031,7 +1047,7 @@ The app has four main screens accessible via the bottom navigation bar:
 - Voice recording button (MediaRecorder API → Whisper)
 - Ingest result card (auto-hides after 4s)
 - Pending approvals section
-- **Settings gear icon** (⚙️ in header) — opens a popup to configure AI model and API key
+- **Settings gear icon** (⚙️ in header) — opens a popup to configure AI model (OpenAI or Gemini), OpenAI API key, and Gemini API key
 
 **Execute Screen** (`#view-execute`) — Four sub-states:
 1. **Empty** — No tasks queued. "What's Next?" button. If wishful items exist, a random one is suggested with a "Promote & Do It" button
@@ -1525,9 +1541,12 @@ API paths that bypass the cache: `/ingest`, `/approve`, `/next`, `/complete`, `/
 
 | Variable | Required | Description |
 |---|---|---|
-| `OPENAI_API_KEY` | Yes | OpenAI API key for AI pipelines and Whisper |
-| `OPENAI_MODEL` | No | AI model to use (default: `gpt-4o-mini`). Allowed: `gpt-5.3`, `gpt-5.3-mini`, `o4-mini`, `o3`, `gpt-4.1`, `gpt-4.1-mini`, `gpt-4.1-nano`, `gpt-4o`, `gpt-4o-mini` |
+| `OPENAI_API_KEY` | Yes* | OpenAI API key — required for OpenAI models + Whisper audio transcription |
+| `GEMINI_API_KEY` | Yes* | Google Gemini API key — required only when using `gemini-*` models. Get one at https://aistudio.google.com/apikey |
+| `OPENAI_MODEL` | No | AI model to use (default: `gpt-4o-mini`). OpenAI: `gpt-5.3`, `gpt-5.3-mini`, `o4-mini`, `o3`, `gpt-4.1`, `gpt-4.1-mini`, `gpt-4.1-nano`, `gpt-4o`, `gpt-4o-mini`. Gemini: `gemini-2.5-pro`, `gemini-2.5-flash`, `gemini-2.0-flash`, `gemini-2.0-flash-lite` |
 | `CES_DB_PATH` | No | SQLite database path (default: `ces.db`) |
+
+\* At minimum one API key is required. `OPENAI_API_KEY` is always needed for voice transcription (Whisper). If using a Gemini model, `GEMINI_API_KEY` is also required.
 
 Set in `.env` file (loaded by `python-dotenv`).
 
@@ -1543,7 +1562,7 @@ pip install -r requirements.txt
 
 # Set up environment
 cp .env.example .env
-# Edit .env with your OPENAI_API_KEY (and optionally OPENAI_MODEL)
+# Edit .env with your OPENAI_API_KEY (and optionally OPENAI_MODEL, GEMINI_API_KEY)
 
 # Run
 python run.py

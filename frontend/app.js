@@ -331,6 +331,8 @@ $('#btn-settings').addEventListener('click', async () => {
         $('#settings-model').value = data.model || 'gpt-4o-mini';
         $('#settings-apikey').value = '';
         $('#settings-apikey').placeholder = data.api_key_masked || 'sk-...';
+        $('#settings-gemini-apikey').value = '';
+        $('#settings-gemini-apikey').placeholder = data.gemini_api_key_masked || 'AIza...';
     } catch (e) {
         // Defaults if API not ready
     }
@@ -356,8 +358,10 @@ $('#btn-settings-save').addEventListener('click', async () => {
         if (model) body.model = model;
         const apiKey = $('#settings-apikey').value.trim();
         if (apiKey) body.api_key = apiKey;
+        const geminiKey = $('#settings-gemini-apikey').value.trim();
+        if (geminiKey) body.gemini_api_key = geminiKey;
 
-        if (!body.model && !body.api_key) {
+        if (!body.model && !body.api_key && !body.gemini_api_key) {
             toast('Nothing to save');
             return;
         }

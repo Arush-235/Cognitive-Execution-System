@@ -1,11 +1,26 @@
 import json
 import os
 from openai import AsyncOpenAI
+from google import genai
+from google.genai import types as gemini_types
+
+
+def _get_provider() -> str:
+    """Return 'gemini' or 'openai' based on the configured model."""
+    model = _get_model()
+    if model.startswith("gemini-"):
+        return "gemini"
+    return "openai"
 
 
 def _get_client() -> AsyncOpenAI:
     """Return an OpenAI client using the current API key from env."""
     return AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
+
+
+def _get_gemini_client() -> genai.Client:
+    """Return a Google GenAI client using the current Gemini API key from env."""
+    return genai.Client(api_key=os.environ.get("GEMINI_API_KEY", ""))
 
 
 def _get_model() -> str:
@@ -18,7 +33,7 @@ _REASONING_MODELS = {"o3", "o4-mini", "o3-mini", "o1", "o1-mini"}
 
 
 def _chat_kwargs(temperature: float = 0.2, max_tokens: int = 2000) -> dict:
-    """Build model-appropriate kwargs for chat.completions.create."""
+    """Build model-appropriate kwargs for chat.completions.create (OpenAI only)."""
     model = _get_model()
     kwargs: dict = {"model": model}
     if any(model.startswith(prefix) for prefix in _REASONING_MODELS):
@@ -30,6 +45,53 @@ def _chat_kwargs(temperature: float = 0.2, max_tokens: int = 2000) -> dict:
     # Force JSON output on all models that support it
     kwargs["response_format"] = {"type": "json_object"}
     return kwargs
+
+
+def _gemini_config(temperature: float = 0.2, max_tokens: int = 2000) -> gemini_types.GenerateContentConfig:
+    """Build a Gemini GenerateContentConfig."""
+    return gemini_types.GenerateContentConfig(
+        temperature=temperature,
+        maxOutputTokens=max_tokens,
+        responseMimeType="application/json",
+    )
+
+
+async def _chat_completion(messages: list[dict], temperature: float = 0.2, max_tokens: int = 2000) -> str:
+    """Unified chat completion across OpenAI and Gemini. Returns raw text."""
+    model = _get_model()
+    provider = _get_provider()
+
+    if provider == "gemini":
+        client = _get_gemini_client()
+        # Convert OpenAI-style messages to Gemini format
+        system_instruction = None
+        contents = []
+        for msg in messages:
+            if msg["role"] == "system":
+                system_instruction = msg["content"]
+            elif msg["role"] == "user":
+                contents.append(gemini_types.Content(role="user", parts=[gemini_types.Part(text=msg["content"])]))
+            elif msg["role"] == "assistant":
+                contents.append(gemini_types.Content(role="model", parts=[gemini_types.Part(text=msg["content"])]))
+
+        config = _gemini_config(temperature=temperature, max_tokens=max_tokens)
+        if system_instruction:
+            config.systemInstruction = system_instruction
+
+        response = await client.aio.models.generate_content(
+            model=model,
+            contents=contents,
+            config=config,
+        )
+        return response.text or ""
+    else:
+        # OpenAI path
+        client = _get_client()
+        response = await client.chat.completions.create(
+            messages=messages,
+            **_chat_kwargs(temperature=temperature, max_tokens=max_tokens),
+        )
+        return response.choices[0].message.content or ""
 
 PARSER_SYSTEM = """You are a task decomposition and classification engine optimized for ADHD execution.
 
@@ -214,16 +276,11 @@ async def parse_input(raw_text: str, existing_context: str = "") -> dict:
         messages.append({"role": "assistant", "content": "Understood. I'll factor in the existing context when decomposing the new input."})
     messages.append({"role": "user", "content": raw_text})
 
-    client = _get_client()
     try:
-        response = await client.chat.completions.create(
-            messages=messages,
-            **_chat_kwargs(temperature=0.2, max_tokens=2000),
-        )
+        raw_content = await _chat_completion(messages, temperature=0.2, max_tokens=2000)
     except Exception as e:
-        raise RuntimeError(f"OpenAI API error ({_get_model()}): {e}") from e
+        raise RuntimeError(f"AI API error ({_get_model()}): {e}") from e
 
-    raw_content = response.choices[0].message.content or ""
     text = _strip_code_fences(raw_content)
     try:
         result = json.loads(text)
@@ -251,19 +308,17 @@ async def generate_plan(items: list[dict], completed_recently: list[dict] = None
         user_parts.append(f"Recently completed (for momentum): {json.dumps(completed_recently)}")
     user_parts.append(f"Active items to plan:\n{json.dumps(items, indent=2)}")
 
-    client = _get_client()
     try:
-        response = await client.chat.completions.create(
-            messages=[
+        raw_content = await _chat_completion(
+            [
                 {"role": "system", "content": PLANNER_SYSTEM},
                 {"role": "user", "content": "\n\n".join(user_parts)},
             ],
-            **_chat_kwargs(temperature=0.3, max_tokens=1500),
+            temperature=0.3, max_tokens=1500,
         )
     except Exception as e:
-        raise RuntimeError(f"OpenAI API error ({_get_model()}): {e}") from e
+        raise RuntimeError(f"AI API error ({_get_model()}): {e}") from e
 
-    raw_content = response.choices[0].message.content or ""
     text = _strip_code_fences(raw_content)
     try:
         return json.loads(text)
@@ -346,16 +401,11 @@ USER'S THINKING OUTPUT / NOTES:
         )
     messages.append({"role": "user", "content": user_content})
 
-    client = _get_client()
     try:
-        response = await client.chat.completions.create(
-            messages=messages,
-            **_chat_kwargs(temperature=0.2, max_tokens=2000),
-        )
+        raw_content = await _chat_completion(messages, temperature=0.2, max_tokens=2000)
     except Exception as e:
-        raise RuntimeError(f"OpenAI API error ({_get_model()}): {e}") from e
+        raise RuntimeError(f"AI API error ({_get_model()}): {e}") from e
 
-    raw_content = response.choices[0].message.content or ""
     text = _strip_code_fences(raw_content)
     try:
         return json.loads(text)
