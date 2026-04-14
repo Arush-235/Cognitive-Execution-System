@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS items (
     thinking_output TEXT,
     revisit_count INTEGER DEFAULT 0,
     complexity_score REAL DEFAULT 5.0,
+    depends_on INTEGER REFERENCES items(id),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -212,6 +213,8 @@ async def _run_migrations(db):
         ("goals", "target_date", "ALTER TABLE goals ADD COLUMN target_date TEXT"),
         ("goals", "status", "ALTER TABLE goals ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"),
         ("goals", "priority_rank", "ALTER TABLE goals ADD COLUMN priority_rank INTEGER DEFAULT 0"),
+        # Dependency DAG
+        ("items", "depends_on", "ALTER TABLE items ADD COLUMN depends_on INTEGER REFERENCES items(id)"),
     ]
     for table, column, sql in migrations:
         if sql is None:

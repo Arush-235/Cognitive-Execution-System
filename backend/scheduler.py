@@ -378,7 +378,7 @@ def _compute_dopamine_alignment(item: dict, user_state: dict) -> float:
         else:
             return -0.5  # delayed reward is hard to start with
     elif momentum == "building":
-        # Transitioning — neutral or quick reward keeps it going
+        # Transitioning  -  neutral or quick reward keeps it going
         if profile == "quick_reward":
             return 1.5
         elif profile == "neutral":
@@ -534,7 +534,7 @@ def select_next_task(
         scored = [(score_task(i, user_state), i) for i in items]
         scored.sort(key=lambda x: x[0], reverse=True)
 
-    # RULE 1: Start Bias — when momentum is none, heavily filter (always active)
+    # RULE 1: Start Bias  -  when momentum is none, heavily filter (always active)
     if momentum == "none":
         starters = [
             (s, i) for s, i in scored
@@ -545,14 +545,14 @@ def select_next_task(
         if starters:
             scored = starters
 
-    # RULE 3: Anti-Avoidance — skip resistance-flagged items (stable+ only)
+    # RULE 3: Anti-Avoidance  -  skip resistance-flagged items (stable+ only)
     if maturity_level in ("stable", "mature") and scored and scored[0][1].get("resistance_flag") and len(scored) > 1:
         if scored[0][0] - scored[1][0] < 2.0:
             non_resistant = [(s, i) for s, i in scored if not i.get("resistance_flag")]
             if non_resistant:
                 scored = non_resistant
 
-    # RULE 4: Energy Matching — if user energy is low, cap task demand (always active)
+    # RULE 4: Energy Matching  -  if user energy is low, cap task demand (always active)
     if energy == "low":
         low_demand = [
             (s, i) for s, i in scored
@@ -610,9 +610,9 @@ def _build_reasoning(task: dict, user_state: dict, circadian: dict) -> str:
     if momentum == "none":
         parts.append(f"Starting with a low-friction task to build momentum")
     elif momentum == "building":
-        parts.append(f"Momentum building — stepping up to a meatier task")
+        parts.append(f"Momentum building  -  stepping up to a meatier task")
     else:
-        parts.append(f"Strong momentum — tackling a high-impact task")
+        parts.append(f"Strong momentum  -  tackling a high-impact task")
 
     # Energy context
     task_load = task.get("cognitive_load", "medium")
@@ -716,7 +716,7 @@ def get_resistance_intervention(
             "type": "decompose",
             "message": (
                 f"'{content_short}' feels too hard. "
-                f"Try: break into a 10-minute starter step, or lower the bar — "
+                f"Try: break into a 10-minute starter step, or lower the bar  -  "
                 f"what's the smallest slice you could do right now?"
             ),
         },
@@ -740,7 +740,7 @@ def get_resistance_intervention(
             "type": "comfort",
             "message": (
                 f"'{content_short}' makes you anxious. "
-                f"That's okay. Try: imagine the worst realistic outcome — is it survivable? "
+                f"That's okay. Try: imagine the worst realistic outcome  -  is it survivable? "
                 f"Or just do the first 2 minutes and give yourself permission to stop."
             ),
         },

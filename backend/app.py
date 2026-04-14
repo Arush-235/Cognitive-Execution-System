@@ -161,7 +161,7 @@ async def onboarding_start():
         await db.commit()
 
         result = await get_onboarding_first_question()
-        message = result.get("message", "Tell me a bit about yourself — what does a typical day look like for you?")
+        message = result.get("message", "Tell me a bit about yourself  -  what does a typical day look like for you?")
 
         # Store the assistant's first message
         await db.execute(
@@ -324,7 +324,7 @@ async def _process_onboarding_extraction(db, extracted: dict):
                     (title, 1 if g.get("urgency") == "this_week" else 0),
                 )
 
-    # Tasks — pre-seed into the task database
+    # Tasks  -  pre-seed into the task database
     tasks = extracted.get("tasks")
     if tasks and isinstance(tasks, list):
         for t in tasks:
@@ -1014,7 +1014,7 @@ async def get_next():
             if track_row:
                 active_track = dict(track_row[0])
 
-        # Check active task lock — if a task is already "doing", return it directly
+        # Check active task lock  -  if a task is already "doing", return it directly
         state = await db.execute_fetchall(
             "SELECT value FROM system_state WHERE key = 'current_active_task_id'"
         )
@@ -1053,7 +1053,7 @@ async def get_next():
                       completion_visibility, skip_count, resistance_flag,
                       execution_class, expanded, source_idea_id,
                       thinking_objective, thinking_output_format, revisit_count,
-                      track_id
+                      track_id, depends_on, goal_id, parent_id
                FROM items
                WHERE status IN ('next', 'inbox', 'backlog') {track_filter}
                ORDER BY priority DESC, sort_order ASC, created_at ASC
@@ -1061,7 +1061,65 @@ async def get_next():
             track_params,
         )
         items = [dict(r) for r in rows]
+
+        # ── Dependency blocking: compute transitive blocked set ──
+        # An item is blocked if its depends_on target is NOT done/archived
+        done_rows = await db.execute_fetchall(
+            "SELECT id FROM items WHERE status IN ('done', 'archived')"
+        )
+        done_ids = {r["id"] for r in done_rows} if done_rows else set()
+
+        # Build depends_on map for candidate items
+        blocked_ids = set()
+        dep_map = {}  # item_id -> depends_on_id
+        for item in items:
+            if item.get("depends_on"):
+                dep_map[item["id"]] = item["depends_on"]
+
+        # Chase dependency chains up to 10 levels for transitive blocking
+        all_dep_targets = set(dep_map.values())
+        checked = {i["id"] for i in items} | done_ids
+        for _ in range(10):
+            unchecked = all_dep_targets - checked
+            if not unchecked:
+                break
+            placeholders = ",".join("?" * len(unchecked))
+            chain_rows = await db.execute_fetchall(
+                f"SELECT id, depends_on, status FROM items WHERE id IN ({placeholders})",
+                list(unchecked),
+            )
+            for cr in chain_rows:
+                checked.add(cr["id"])
+                if cr["status"] in ("done", "archived"):
+                    done_ids.add(cr["id"])
+                elif cr["depends_on"]:
+                    dep_map[cr["id"]] = cr["depends_on"]
+                    all_dep_targets.add(cr["depends_on"])
+
+        # Mark items as blocked if their dependency (transitive) isn't done
+        def _is_blocked(item_id, visited=None):
+            if visited is None:
+                visited = set()
+            if item_id in visited:
+                return False  # cycle guard
+            visited.add(item_id)
+            dep = dep_map.get(item_id)
+            if dep is None:
+                return False
+            if dep not in done_ids:
+                return True
+            return _is_blocked(dep, visited)
+
+        for item in items:
+            if _is_blocked(item["id"]):
+                blocked_ids.add(item["id"])
+                item["_blocked"] = True
+                item["_blocked_by"] = dep_map.get(item["id"])
+            else:
+                item["_blocked"] = False
+
         if not items:
+
             # Check if there are wishful items to suggest
             wish_rows = await db.execute_fetchall(
                 "SELECT id, content, cluster, duration_minutes FROM items WHERE status = 'wishful' ORDER BY RANDOM() LIMIT 1"
@@ -1136,9 +1194,11 @@ async def get_next():
                 "user_state": user_state,
             }
 
-        # Run scheduling engine — returns scored sequence
+        # Run scheduling engine  -  returns scored sequence
+        # Filter out blocked items from scheduling (they can't be started)
+        schedulable_items = [i for i in items if i["id"] not in blocked_ids]
         result = select_next_task(
-            items, user_state,
+            schedulable_items, user_state,
             maturity_level=maturity["level"],
             active_goal_ids=active_goal_ids,
         )
@@ -1163,7 +1223,7 @@ async def get_next():
                 break
         if len(option_items) < 3:
             for item in items:
-                if item["id"] not in seen_ids:
+                if item["id"] not in seen_ids and item["id"] not in blocked_ids:
                     option_items.append(item)
                     seen_ids.add(item["id"])
                 if len(option_items) >= 3:
@@ -1171,8 +1231,13 @@ async def get_next():
 
         options = [_format_option(item, user_state) for item in option_items]
 
+        # Include up to 2 blocked items so user sees what's waiting
+        blocked_items = [i for i in items if i["id"] in blocked_ids][:2]
+        blocked_options = [_format_option(item, user_state, blocked=True) for item in blocked_items]
+
         resp = {
             "options": options,
+            "blocked_options": blocked_options,
             "big_picture": goal_context,
             "user_state": user_state,
             "maturity": maturity,
@@ -1356,7 +1421,7 @@ async def override_task(body: OverrideInput):
         skip_category = body.skip_category or "not_now"
         skip_result = handle_skip(existing, skip_category=skip_category)
 
-        # Update item with skip tracking — DO NOT mutate content
+        # Update item with skip tracking  -  DO NOT mutate content
         await db.execute(
             """UPDATE items SET status = 'backlog',
                skip_count = ?, resistance_flag = ?, dominant_skip_reason = ?
@@ -1469,7 +1534,7 @@ async def expand_task(body: ExpandInput):
 
 @app.get("/plan")
 async def get_plan():
-    """Return full plan view — all items grouped by track, then cluster."""
+    """Return full plan view  -  all items grouped by track, then cluster."""
     db = await get_db()
     try:
         rows = await db.execute_fetchall(
@@ -1493,6 +1558,35 @@ async def get_plan():
                     "clusters": {},
                 }
             by_track[tname]["clusters"].setdefault(c, []).append(item)
+
+        # Dependency-aware ordering within each cluster
+        # Items with depends_on chains are sorted so prerequisites come first
+        for tname, tdata in by_track.items():
+            for cname, citems in tdata["clusters"].items():
+                id_to_item = {it["id"]: it for it in citems}
+                # Simple topo-sort: items with no deps first, then their dependents
+                ordered = []
+                placed = set()
+                remaining = list(citems)
+                for _ in range(len(remaining) + 1):
+                    progress = False
+                    next_remaining = []
+                    for it in remaining:
+                        dep = it.get("depends_on")
+                        if dep is None or dep in placed or dep not in id_to_item:
+                            ordered.append(it)
+                            placed.add(it["id"])
+                            progress = True
+                        else:
+                            next_remaining.append(it)
+                    remaining = next_remaining
+                    if not remaining:
+                        break
+                    if not progress:
+                        # Cycle or external dep - append remaining as-is
+                        ordered.extend(remaining)
+                        break
+                tdata["clusters"][cname] = ordered
 
         # Pending inbox items
         inbox_rows = await db.execute_fetchall(
@@ -1822,9 +1916,9 @@ async def _get_user_persona_context(db) -> str:
         if key == "work_speed_profile" and isinstance(val, dict):
             ratio = val.get("global_speed_ratio", 1.0)
             if ratio < 0.8:
-                parts.append(f"  - This user is FAST — they complete tasks in ~{int(ratio*100)}% of estimated time. REDUCE your estimates.")
+                parts.append(f"  - This user is FAST  -  they complete tasks in ~{int(ratio*100)}% of estimated time. REDUCE your estimates.")
             elif ratio > 1.3:
-                parts.append(f"  - This user takes LONGER than estimates — ~{int(ratio*100)}% of estimated time. Be generous with time.")
+                parts.append(f"  - This user takes LONGER than estimates  -  ~{int(ratio*100)}% of estimated time. Be generous with time.")
             else:
                 parts.append(f"  - This user's speed is close to estimates (~{int(ratio*100)}%).")
 
@@ -1950,6 +2044,15 @@ async def _insert_task_batch(
         # Per-task goal override: AI may link individual tasks to different goals
         task_goal_id = goal_id
 
+        # Resolve depends_on_item_id from AI (cross-batch dependency on existing item)
+        depends_on_item = task.get("depends_on_item_id")
+        if depends_on_item is not None:
+            check = await db.execute_fetchall(
+                "SELECT id FROM items WHERE id = ?", (depends_on_item,)
+            )
+            if not check:
+                depends_on_item = None
+
         # Respect AI-suggested status (e.g. 'wishful' for bucket list items)
         suggested_status = task.get("suggested_status", "inbox")
         if suggested_status not in ("inbox", "next", "backlog", "wishful"):
@@ -1962,8 +2065,9 @@ async def _insert_task_batch(
                                   initiation_friction, completion_visibility,
                                   execution_class, source_idea_id, parent_id,
                                   thinking_objective, thinking_output_format,
-                                  goal_id, track_id, complexity_score, sort_order)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                  goal_id, track_id, complexity_score, sort_order,
+                                  depends_on)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 task.get("content", ""),
                 task.get("layer", "operational"),
@@ -1987,9 +2091,21 @@ async def _insert_task_batch(
                 task.get("track_id"),
                 min(max(task.get("complexity_score", 5.0), 0), 10),
                 i,
+                depends_on_item,  # cross-batch dep (resolved above) or None
             ),
         )
         item_ids.append(cursor.lastrowid)
+
+    # Second pass: resolve depends_on_index (intra-batch dependencies)
+    for i, task in enumerate(tasks):
+        dep_idx = task.get("depends_on_index")
+        if dep_idx is not None and isinstance(dep_idx, int) and 0 <= dep_idx < len(item_ids) and dep_idx != i:
+            # Only set if this item doesn't already have a cross-batch depends_on
+            if task.get("depends_on_item_id") is None:
+                await db.execute(
+                    "UPDATE items SET depends_on = ? WHERE id = ?",
+                    (item_ids[dep_idx], item_ids[i]),
+                )
 
     await db.commit()
     return item_ids, skipped_dupes
@@ -2015,7 +2131,7 @@ async def _get_context_summary() -> str:
         item_rows = await db.execute_fetchall(
             """SELECT i.id, i.content, i.layer, i.type, i.cluster, i.status,
                       i.parent_id, i.goal_id, i.execution_class, i.track_id,
-                      t.name as track_name
+                      i.depends_on, t.name as track_name
                FROM items i
                LEFT JOIN tracks t ON i.track_id = t.id
                WHERE i.status != 'done'
@@ -2061,9 +2177,10 @@ async def _get_context_summary() -> str:
                     parent_note = f" (child of item#{it['parent_id']})" if it.get("parent_id") else ""
                     goal_note = f" (goal#{it['goal_id']})" if it.get("goal_id") else ""
                     track_note = f" [track: {it['track_name']}]" if it.get("track_name") else ""
+                    dep_note = f" (depends on item#{it['depends_on']})" if it.get("depends_on") else ""
                     parts.append(
                         f"    item#{it['id']} {it['layer']} [{it['status']}] "
-                        f"{it['content']}{parent_note}{goal_note}{track_note}"
+                        f"{it['content']}{parent_note}{goal_note}{dep_note}{track_note}"
                     )
 
         if done:
@@ -2180,7 +2297,7 @@ def _format_execution_block(now_item: dict, after: list[dict],
     return result
 
 
-def _format_option(item: dict, user_state: dict = None) -> dict:
+def _format_option(item: dict, user_state: dict = None, blocked: bool = False) -> dict:
     """Format a task as a selectable option card."""
     energy_emoji = {"low": "⚡", "medium": "🔥", "high": "💪"}.get(
         item.get("energy_required", "medium"), "🔥"
@@ -2212,7 +2329,10 @@ def _format_option(item: dict, user_state: dict = None) -> dict:
         "execution_class": item.get("execution_class", "linear"),
         "is_thinking": item.get("type") == "thinking",
         "track_id": item.get("track_id"),
+        "blocked": blocked,
     }
+    if blocked and item.get("_blocked_by"):
+        opt["blocked_by"] = item["_blocked_by"]
     if item.get("type") == "thinking":
         opt["thinking_objective"] = item.get("thinking_objective", "")
     return opt

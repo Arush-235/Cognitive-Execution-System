@@ -1,4 +1,4 @@
-/* CES — Cognitive Execution System — LADDERS Design System */
+/* CES  -  Cognitive Execution System  -  LADDERS Design System */
 
 :root {
     /* Brand */
@@ -337,7 +337,7 @@ body {
     margin-bottom: 20px;
 }
 
-/* Choose screen — pick from top 3 */
+/* Choose screen  -  pick from top 3 */
 .choose-label {
     font-size: 0.72rem;
     font-weight: 800;
@@ -375,6 +375,20 @@ body {
     border-color: var(--accent);
     background: linear-gradient(135deg, var(--accent-bg), var(--surface));
     box-shadow: 0 2px 8px rgba(191, 32, 32, 0.08);
+}
+.option-blocked {
+    opacity: 0.45;
+    cursor: not-allowed;
+    pointer-events: none;
+    border-style: dashed;
+    border-color: var(--border);
+}
+.option-blocked-tag {
+    font-size: 0.65rem;
+    font-weight: 800;
+    letter-spacing: 1.5px;
+    color: var(--muted);
+    margin-bottom: 6px;
 }
 .option-rec-tag {
     font-size: 0.65rem;
@@ -757,7 +771,7 @@ body {
 .hidden { display: none !important; }
 .modal.hidden { display: none !important; }
 
-/* Busy state — prevent interaction on all buttons */
+/* Busy state  -  prevent interaction on all buttons */
 .app-busy button:not(.pi-btn):not(:disabled) {
     pointer-events: none;
     opacity: 0.6;
@@ -1190,7 +1204,7 @@ button:disabled {
     border-radius: var(--radius-sm);
 }
 
-/* Plan view — thinking task indicators */
+/* Plan view  -  thinking task indicators */
 .plan-item-thinking {
     border-left: 3px solid #7c3aed;
 }
@@ -1250,7 +1264,7 @@ button:disabled {
     line-height: 1;
 }
 
-/* ── PLAN VIEW — TRACK GROUPS ─────────────────── */
+/* ── PLAN VIEW  -  TRACK GROUPS ─────────────────── */
 
 .plan-track-group {
     margin-bottom: 24px;
@@ -1441,7 +1455,7 @@ button:disabled {
     opacity: 0.85; transform: scale(0.97);
 }
 
-/* ── Onboarding — Conversational Interview ──────────────────── */
+/* ── Onboarding  -  Conversational Interview ──────────────────── */
 
 .onboarding {
     position: fixed;

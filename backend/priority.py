@@ -1,4 +1,4 @@
-"""Priority scoring engine — deterministic backbone.
+"""Priority scoring engine  -  deterministic backbone.
 
 Uses the ADHD-aware scheduler for full scoring when user state is available,
 falls back to a simpler formula for ingestion-time priority.

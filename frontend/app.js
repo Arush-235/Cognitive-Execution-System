@@ -1,4 +1,4 @@
-/* CES — Cognitive Execution System — Frontend */
+/* CES  -  Cognitive Execution System  -  Frontend */
 
 const API = '';  // same origin
 
@@ -125,7 +125,7 @@ function applyTrackTheme() {
 // Initialise tracks on load
 loadTracks();
 
-// ── Onboarding — Conversational Interview ────────────────────
+// ── Onboarding  -  Conversational Interview ────────────────────
 
 async function checkOnboarding() {
     try {
@@ -133,7 +133,7 @@ async function checkOnboarding() {
         if (data.onboarding_complete) return; // already done
         showOnboarding();
     } catch (e) {
-        // API not ready or first load — silently skip
+        // API not ready or first load  -  silently skip
     }
 }
 
@@ -261,7 +261,7 @@ function showOnboarding() {
         }
     });
 
-    // Start the interview — fetch first AI question
+    // Start the interview  -  fetch first AI question
     (async () => {
         showTyping(true);
         try {
@@ -272,7 +272,7 @@ function showOnboarding() {
             textInput.focus();
         } catch (e) {
             showTyping(false);
-            addBubble("Hi! Tell me about yourself — what does your typical day look like?", 'assistant');
+            addBubble("Hi! Tell me about yourself  -  what does your typical day look like?", 'assistant');
             inputArea.classList.remove('hidden');
         }
     })();
@@ -374,9 +374,9 @@ async function loadWeeklyStats() {
             let pHtml = '<div class="stats-section-label">Your work profile</div>';
             const ratio = p.global_speed_ratio;
             if (ratio < 0.8) {
-                pHtml += `<div class="stats-persona-line">⚡ You're a fast worker — finishing at ${Math.round(ratio * 100)}% of estimated time</div>`;
+                pHtml += `<div class="stats-persona-line">⚡ You're a fast worker  -  finishing at ${Math.round(ratio * 100)}% of estimated time</div>`;
             } else if (ratio > 1.2) {
-                pHtml += `<div class="stats-persona-line">🐢 You tend to take longer — ${Math.round(ratio * 100)}% of estimates. We're adjusting!</div>`;
+                pHtml += `<div class="stats-persona-line">🐢 You tend to take longer  -  ${Math.round(ratio * 100)}% of estimates. We're adjusting!</div>`;
             } else {
                 pHtml += `<div class="stats-persona-line">✅ Estimates are well-calibrated to your pace</div>`;
             }
@@ -389,7 +389,7 @@ async function loadWeeklyStats() {
 
         popup.classList.remove('hidden');
     } catch (e) {
-        // Silently fail — don't block the app
+        // Silently fail  -  don't block the app
     }
 }
 
@@ -721,13 +721,13 @@ function showBreakScreen(breakInfo) {
 let _lastOptions = null; // store options so Back button works
 
 async function loadExecution() {
-    // If timer is already running, just show it — don't refetch
+    // If timer is already running, just show it  -  don't refetch
     if (_timerRunning && currentNow) {
         showExecState('timer');
         return;
     }
 
-    // Prompt check-in if no recent one (non-blocking — user can skip)
+    // Prompt check-in if no recent one (non-blocking  -  user can skip)
     try {
         const ci = await api('/checkin/latest');
         if (!ci.has_recent) {
@@ -856,8 +856,22 @@ function renderOptionsScreen(data) {
         </button>`;
     }).join('');
 
+    // Render blocked items (visible but not selectable)
+    if (data.blocked_options && data.blocked_options.length > 0) {
+        list.insertAdjacentHTML('beforeend', data.blocked_options.map(opt => `
+        <div class="option-card option-blocked" title="Blocked by another task">
+            <div class="option-blocked-tag">🔒 BLOCKED</div>
+            <div class="option-content">${esc(opt.content)}</div>
+            <div class="option-meta">
+                <span>${opt.duration_minutes}m</span>
+                <span>${opt.energy_emoji} ${esc(opt.energy_required)}</span>
+                ${opt.cluster ? `<span>${esc(opt.cluster)}</span>` : ''}
+            </div>
+        </div>`).join(''));
+    }
+
     // Attach click handlers
-    list.querySelectorAll('.option-card').forEach(card => {
+    list.querySelectorAll('.option-card:not(.option-blocked)').forEach(card => {
         card.addEventListener('click', () => selectOption(parseInt(card.dataset.id)));
     });
 }
@@ -1226,7 +1240,7 @@ $('#btn-timer-done').addEventListener('click', async () => {
     }
 });
 
-// ── Skip — Categorized ───────────────────────────────────────────
+// ── Skip  -  Categorized ───────────────────────────────────────────
 
 let _skipCategory = 'not_now';
 let _skipCategories = null;
@@ -1511,12 +1525,14 @@ function renderPlanItem(item, trackColor) {
     const isDone = item.status === 'done';
     const isThinking = item.type === 'thinking';
     const isExpanding = item.execution_class === 'expanding';
+    const hasDep = item.depends_on != null;
     const borderStyle = trackColor ? `border-left: 3px solid ${trackColor}` : '';
     return `
         <div class="plan-item ${isDone ? 'plan-item-done' : ''} ${isThinking ? 'plan-item-thinking' : ''}" data-item-id="${item.id}" style="${borderStyle}">
             <div class="status-dot status-${item.status}"></div>
             <div class="pi-body">
                 <div class="pi-content">
+                    ${hasDep ? '<span class="pi-dep-badge" title="Depends on another task">🔗</span> ' : ''}
                     ${isThinking ? '<span class="pi-thinking-badge">🧠</span> ' : ''}
                     ${isExpanding && !isThinking ? '<span class="pi-expanding-badge">📐</span> ' : ''}
                     ${esc(item.content)}
@@ -1526,6 +1542,7 @@ function renderPlanItem(item, trackColor) {
                     <span>· ${item.layer}</span>
                     <span>· ${item.energy_required || 'medium'}</span>
                     ${isThinking ? '<span>· thinking</span>' : ''}
+                    ${hasDep ? `<span>· depends on #${item.depends_on}</span>` : ''}
                     <span class="pi-status-label status-label-${item.status}">${statusLabels[item.status] || item.status}</span>
                 </div>
             </div>
