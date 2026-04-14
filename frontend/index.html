@@ -106,7 +106,33 @@
 
         <!-- PLAN VIEW -->
         <div id="view-plan" class="view">
+            <!-- Daily Intention -->
+            <div id="daily-intention" class="plan-section">
+                <h3>🎯 Today's Focus</h3>
+                <div id="intention-content"></div>
+            </div>
+            <!-- Goals -->
+            <div id="goals-section" class="plan-section">
+                <div class="goals-header">
+                    <h3>🏔 Goals</h3>
+                    <button id="btn-add-goal" class="btn-sm">+ Add</button>
+                </div>
+                <div id="goals-list"></div>
+                <div id="goal-form" class="hidden">
+                    <input id="goal-input" type="text" placeholder="What do you want to achieve?" class="goal-input">
+                    <div class="modal-actions" style="margin-top:8px">
+                        <button id="btn-goal-save" class="btn-primary" style="font-size:0.82rem;padding:8px 14px">Save</button>
+                        <button id="btn-goal-cancel" class="btn-secondary" style="font-size:0.82rem;padding:8px 14px">Cancel</button>
+                    </div>
+                </div>
+            </div>
+            <!-- Tasks -->
             <div id="plan-content"></div>
+            <!-- Weekly Review -->
+            <div id="weekly-review" class="plan-section">
+                <h3>📊 Weekly Review</h3>
+                <div id="review-content"></div>
+            </div>
         </div>
 
         <!-- WISHES VIEW -->
@@ -118,14 +144,44 @@
             <div id="wishes-content"></div>
         </div>
 
-        <!-- Skip Modal -->
+        <!-- Skip Modal — Categorized -->
         <div id="skip-modal" class="modal hidden">
             <div class="modal-content">
-                <h3>Why skip?</h3>
-                <textarea id="skip-reason" placeholder="Quick reason..." rows="2"></textarea>
+                <h3>Why are you skipping?</h3>
+                <div id="skip-categories" class="skip-categories"></div>
+                <textarea id="skip-reason" placeholder="Optional: anything else..." rows="2"></textarea>
                 <div class="modal-actions">
                     <button id="btn-skip-confirm" class="btn-primary">Skip</button>
                     <button id="btn-skip-cancel" class="btn-secondary">Cancel</button>
+                </div>
+                <div id="skip-intervention" class="skip-intervention hidden"></div>
+            </div>
+        </div>
+
+        <!-- Check-in Modal -->
+        <div id="checkin-modal" class="modal hidden">
+            <div class="modal-content">
+                <h3>Quick Check-in</h3>
+                <p class="checkin-prompt">How are you feeling right now?</p>
+                <div class="checkin-row">
+                    <label class="checkin-label">Energy</label>
+                    <div class="checkin-slider-row">
+                        <span>😴</span>
+                        <input type="range" id="checkin-energy" min="1" max="5" value="3" class="checkin-range">
+                        <span>💪</span>
+                    </div>
+                </div>
+                <div class="checkin-row">
+                    <label class="checkin-label">Focus</label>
+                    <div class="checkin-slider-row">
+                        <span>🌀</span>
+                        <input type="range" id="checkin-focus" min="1" max="5" value="3" class="checkin-range">
+                        <span>🎯</span>
+                    </div>
+                </div>
+                <div class="modal-actions">
+                    <button id="btn-checkin-submit" class="btn-primary">Done</button>
+                    <button id="btn-checkin-skip" class="btn-secondary">Skip</button>
                 </div>
             </div>
         </div>
@@ -145,44 +201,24 @@
             </div>
         </div>
 
-        <!-- Onboarding Overlay -->
+        <!-- Onboarding Overlay — Conversational Interview -->
         <div id="onboarding" class="onboarding hidden">
             <div class="onboarding-card">
-                <!-- Step 1: Welcome + Routine question -->
-                <div id="onb-step-1" class="onb-step">
+                <div class="onb-header">
                     <div class="onb-icon">🧠</div>
                     <h2>Welcome to CES</h2>
-                    <p class="onb-desc">Your Cognitive Execution System. Let's personalize your experience.</p>
-                    <p class="onb-question">Do you have a fixed daily routine?</p>
-                    <div class="onb-choice-row">
-                        <button id="onb-routine-yes" class="onb-choice-btn">Yes, mostly</button>
-                        <button id="onb-routine-no" class="onb-choice-btn onb-choice-alt">No, it varies</button>
-                    </div>
+                    <p class="onb-desc">Let's get to know you so we can help you work with your brain, not against it.</p>
                 </div>
-                <!-- Step 2: Time inputs (shown only if routine = yes) -->
-                <div id="onb-step-2" class="onb-step hidden">
-                    <div class="onb-icon">⏰</div>
-                    <h2>Your Schedule</h2>
-                    <p class="onb-desc">This helps us match tasks to your energy levels.</p>
-                    <div class="onb-fields">
-                        <label class="onb-field">
-                            <span>Wake up</span>
-                            <input type="time" id="onb-wake" value="07:00">
-                        </label>
-                        <label class="onb-field">
-                            <span>Work starts</span>
-                            <input type="time" id="onb-work-start" value="09:00">
-                        </label>
-                        <label class="onb-field">
-                            <span>Work ends</span>
-                            <input type="time" id="onb-work-end" value="17:00">
-                        </label>
-                        <label class="onb-field">
-                            <span>Bedtime</span>
-                            <input type="time" id="onb-sleep" value="23:00">
-                        </label>
+                <div id="onb-chat" class="onb-chat"></div>
+                <div id="onb-typing" class="onb-typing hidden">
+                    <span></span><span></span><span></span>
+                </div>
+                <div id="onb-input-area" class="onb-input-area hidden">
+                    <textarea id="onb-text" class="onb-text" placeholder="Type your answer..." rows="2"></textarea>
+                    <div class="onb-actions">
+                        <button id="onb-send" class="btn-primary onb-send">Send</button>
+                        <button id="onb-mic" class="btn-mic onb-mic-btn">🎙️</button>
                     </div>
-                    <button id="onb-submit" class="btn-primary onb-submit">Let's go →</button>
                 </div>
             </div>
         </div>

@@ -125,7 +125,7 @@ function applyTrackTheme() {
 // Initialise tracks on load
 loadTracks();
 
-// ── Onboarding ───────────────────────────────────────────────────
+// ── Onboarding — Conversational Interview ────────────────────
 
 async function checkOnboarding() {
     try {
@@ -140,51 +140,142 @@ async function checkOnboarding() {
 function showOnboarding() {
     const overlay = $('#onboarding');
     overlay.classList.remove('hidden');
-    // Hide the main app content behind
     $('#nav').style.display = 'none';
     $('#track-bar').style.display = 'none';
     $$('.view').forEach(v => v.style.display = 'none');
 
-    let hasRoutine = false;
+    const chat = $('#onb-chat');
+    const inputArea = $('#onb-input-area');
+    const textInput = $('#onb-text');
+    const sendBtn = $('#onb-send');
+    const micBtn = $('#onb-mic');
+    const typingEl = $('#onb-typing');
+    let onbBusy = false;
 
-    $('#onb-routine-yes').addEventListener('click', () => {
-        hasRoutine = true;
-        $('#onb-step-1').classList.add('hidden');
-        $('#onb-step-2').classList.remove('hidden');
-    });
+    function addBubble(text, role) {
+        const bubble = document.createElement('div');
+        bubble.className = `onb-bubble ${role}`;
+        bubble.textContent = text;
+        chat.appendChild(bubble);
+        chat.scrollTop = chat.scrollHeight;
+    }
 
-    $('#onb-routine-no').addEventListener('click', async () => {
-        hasRoutine = false;
-        await submitOnboarding(false);
-    });
+    function showTyping(show) {
+        typingEl.classList.toggle('hidden', !show);
+        if (show) chat.scrollTop = chat.scrollHeight;
+    }
 
-    $('#onb-submit').addEventListener('click', async () => {
-        await submitOnboarding(true);
-    });
-
-    async function submitOnboarding(withRoutine) {
-        const body = {
-            has_routine: withRoutine,
-            wake_time: withRoutine ? $('#onb-wake').value : null,
-            work_start: withRoutine ? $('#onb-work-start').value : null,
-            work_end: withRoutine ? $('#onb-work-end').value : null,
-            sleep_time: withRoutine ? $('#onb-sleep').value : null,
-        };
-        try {
-            await api('/onboarding/submit', {
-                method: 'POST',
-                body: JSON.stringify(body),
-            });
-        } catch (e) {
-            // Still dismiss — don't block
-        }
-        // Dismiss overlay, show app
+    function finishOnboarding() {
         overlay.classList.add('hidden');
         $('#nav').style.display = '';
         $('#track-bar').style.display = '';
         $$('.view').forEach(v => v.style.display = '');
         toast('Welcome! Capture your first task →');
     }
+
+    async function sendMessage() {
+        const text = textInput.value.trim();
+        if (!text || onbBusy) return;
+        onbBusy = true;
+        sendBtn.disabled = true;
+
+        addBubble(text, 'user');
+        textInput.value = '';
+        showTyping(true);
+
+        try {
+            const resp = await api('/onboarding/message', {
+                method: 'POST',
+                body: JSON.stringify({ message: text }),
+            });
+            showTyping(false);
+            if (resp.message) addBubble(resp.message, 'assistant');
+            if (resp.done) {
+                setTimeout(finishOnboarding, 1500);
+                inputArea.classList.add('hidden');
+            }
+        } catch (e) {
+            showTyping(false);
+            addBubble("Sorry, something went wrong. Let's try again.", 'assistant');
+        }
+        onbBusy = false;
+        sendBtn.disabled = false;
+        textInput.focus();
+    }
+
+    sendBtn.addEventListener('click', sendMessage);
+    textInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            sendMessage();
+        }
+    });
+
+    // Voice input for onboarding
+    micBtn.addEventListener('click', async () => {
+        if (onbBusy) return;
+        if (isRecording && mediaRecorder) {
+            mediaRecorder.stop();
+            return;
+        }
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+            const chunks = [];
+            mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
+            mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
+            mediaRecorder.onstop = async () => {
+                stream.getTracks().forEach(t => t.stop());
+                isRecording = false;
+                micBtn.textContent = '🎙️';
+                if (chunks.length === 0) return;
+                const blob = new Blob(chunks, { type: 'audio/webm' });
+                const fd = new FormData();
+                fd.append('file', blob, 'onb_audio.webm');
+
+                onbBusy = true;
+                sendBtn.disabled = true;
+                showTyping(true);
+
+                try {
+                    const resp = await fetch('/onboarding/audio', { method: 'POST', body: fd });
+                    const data = await resp.json();
+                    showTyping(false);
+                    if (data.transcript) addBubble(data.transcript, 'user');
+                    if (data.message) addBubble(data.message, 'assistant');
+                    if (data.done) {
+                        setTimeout(finishOnboarding, 1500);
+                        inputArea.classList.add('hidden');
+                    }
+                } catch (e) {
+                    showTyping(false);
+                    addBubble("Couldn't process audio. Try typing instead.", 'assistant');
+                }
+                onbBusy = false;
+                sendBtn.disabled = false;
+            };
+            mediaRecorder.start();
+            isRecording = true;
+            micBtn.textContent = '⏹️';
+        } catch (e) {
+            toast('Microphone access denied');
+        }
+    });
+
+    // Start the interview — fetch first AI question
+    (async () => {
+        showTyping(true);
+        try {
+            const resp = await api('/onboarding/start');
+            showTyping(false);
+            if (resp.message) addBubble(resp.message, 'assistant');
+            inputArea.classList.remove('hidden');
+            textInput.focus();
+        } catch (e) {
+            showTyping(false);
+            addBubble("Hi! Tell me about yourself — what does your typical day look like?", 'assistant');
+            inputArea.classList.remove('hidden');
+        }
+    })();
 }
 
 checkOnboarding();
@@ -635,6 +726,14 @@ async function loadExecution() {
         showExecState('timer');
         return;
     }
+
+    // Prompt check-in if no recent one (non-blocking — user can skip)
+    try {
+        const ci = await api('/checkin/latest');
+        if (!ci.has_recent) {
+            await showCheckinModal();
+        }
+    } catch (e) { /* non-critical */ }
 
     setBusy(true);
     try {
@@ -1127,13 +1226,50 @@ $('#btn-timer-done').addEventListener('click', async () => {
     }
 });
 
-// ── Skip ─────────────────────────────────────────────────────────
+// ── Skip — Categorized ───────────────────────────────────────────
 
-$('#btn-skip').addEventListener('click', () => {
+let _skipCategory = 'not_now';
+let _skipCategories = null;
+
+async function loadSkipCategories() {
+    if (_skipCategories) return;
+    try {
+        const data = await api('/skip-categories');
+        _skipCategories = data.categories || [];
+    } catch (e) {
+        _skipCategories = [
+            {key: 'not_now', label: 'Not right now', emoji: '⏰'},
+            {key: 'too_hard', label: 'Feels too hard', emoji: '🧱'},
+            {key: 'unclear', label: 'Not sure what to do', emoji: '❓'},
+            {key: 'boring', label: 'Too boring', emoji: '😴'},
+            {key: 'anxious', label: 'Makes me anxious', emoji: '😰'},
+        ];
+    }
+}
+
+function renderSkipCategories() {
+    const container = $('#skip-categories');
+    if (!container || !_skipCategories) return;
+    container.innerHTML = _skipCategories.map(c =>
+        `<button class="skip-cat-btn ${c.key === _skipCategory ? 'skip-cat-active' : ''}" data-cat="${c.key}">${c.emoji} ${c.label}</button>`
+    ).join('');
+    container.querySelectorAll('.skip-cat-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            _skipCategory = btn.dataset.cat;
+            container.querySelectorAll('.skip-cat-btn').forEach(b => b.classList.remove('skip-cat-active'));
+            btn.classList.add('skip-cat-active');
+        });
+    });
+}
+
+$('#btn-skip').addEventListener('click', async () => {
     if (_busy) return;
-    $('#skip-modal').classList.remove('hidden');
+    await loadSkipCategories();
+    _skipCategory = 'not_now';
+    renderSkipCategories();
     $('#skip-reason').value = '';
-    setTimeout(() => $('#skip-reason').focus(), 100);
+    $('#skip-intervention').classList.add('hidden');
+    $('#skip-modal').classList.remove('hidden');
 });
 
 $('#btn-skip-cancel').addEventListener('click', () => {
@@ -1147,8 +1283,7 @@ $('#skip-modal').addEventListener('click', (e) => {
 });
 
 $('#btn-skip-confirm').addEventListener('click', async () => {
-    const reason = $('#skip-reason').value.trim();
-    if (!reason) { toast('Reason required'); return; }
+    const reason = $('#skip-reason').value.trim() || _skipCategory;
     if (!currentNow || _busy) return;
 
     const btn = $('#btn-skip-confirm');
@@ -1158,19 +1293,31 @@ $('#btn-skip-confirm').addEventListener('click', async () => {
     try {
         const data = await api('/override', {
             method: 'POST',
-            body: JSON.stringify({ item_id: currentNow.id, reason }),
+            body: JSON.stringify({
+                item_id: currentNow.id,
+                reason,
+                skip_category: _skipCategory,
+            }),
         });
+
+        // Show intervention if returned
+        if (data.avoidance_warning) {
+            const intEl = $('#skip-intervention');
+            intEl.textContent = data.avoidance_warning;
+            intEl.classList.remove('hidden');
+            // Keep modal open for 2s so user sees the intervention
+            await new Promise(r => setTimeout(r, 2000));
+        }
+
         $('#skip-modal').classList.add('hidden');
         stopTimerCleanly();
         toast('Skipped');
-        // /override now returns options for next pick
         if (data.options && data.options.length > 0) {
             _lastOptions = data;
             currentNow = null;
             renderOptionsScreen(data);
             showExecState('choose');
         } else if (data.now) {
-            // Active task already locked (edge case)
             currentNow = data.now;
             _afterData = data.after || [];
             renderReadyScreen(data);
@@ -1184,6 +1331,44 @@ $('#btn-skip-confirm').addEventListener('click', async () => {
     } finally {
         btn.disabled = false;
         setBusy(false);
+    }
+});
+
+// ── Check-in Modal ───────────────────────────────────────────────
+
+let _checkinResolve = null;
+
+function showCheckinModal() {
+    return new Promise(resolve => {
+        _checkinResolve = resolve;
+        $('#checkin-energy').value = 3;
+        $('#checkin-focus').value = 3;
+        $('#checkin-modal').classList.remove('hidden');
+    });
+}
+
+$('#btn-checkin-submit').addEventListener('click', async () => {
+    const energy = parseInt($('#checkin-energy').value, 10);
+    const focus = parseInt($('#checkin-focus').value, 10);
+    $('#checkin-modal').classList.add('hidden');
+    try {
+        await api('/checkin', {
+            method: 'POST',
+            body: JSON.stringify({ energy, focus }),
+        });
+    } catch (e) { /* non-critical */ }
+    if (_checkinResolve) { _checkinResolve(true); _checkinResolve = null; }
+});
+
+$('#btn-checkin-skip').addEventListener('click', () => {
+    $('#checkin-modal').classList.add('hidden');
+    if (_checkinResolve) { _checkinResolve(false); _checkinResolve = null; }
+});
+
+$('#checkin-modal').addEventListener('click', (e) => {
+    if (e.target === $('#checkin-modal')) {
+        $('#checkin-modal').classList.add('hidden');
+        if (_checkinResolve) { _checkinResolve(false); _checkinResolve = null; }
     }
 });
 
@@ -1273,6 +1458,11 @@ async function submitExpansion(itemId) {
 // ── Plan view ────────────────────────────────────────────────────
 
 async function loadPlan() {
+    // Load goals, intention, review in parallel with plan data
+    loadGoals();
+    loadDailyIntention();
+    loadWeeklyReview();
+
     try {
         const data = await api('/plan');
         const el = $('#plan-content');
@@ -1389,6 +1579,144 @@ function bindPlanItems() {
             openDeleteConfirm(parseInt(btn.dataset.id));
         });
     });
+}
+
+// ── Goals ─────────────────────────────────────────────────────────
+
+async function loadGoals() {
+    const el = $('#goals-list');
+    if (!el) return;
+    try {
+        const data = await api('/goals');
+        const goals = data.goals || [];
+        if (!goals.length) {
+            el.innerHTML = '<p class="text-dim" style="font-size:0.85rem;">No goals yet. Add one to anchor your work.</p>';
+            return;
+        }
+        el.innerHTML = goals.map(g => `
+            <div class="goal-card" data-goal-id="${g.id}">
+                <div class="goal-info">
+                    <div class="goal-title">${esc(g.summary)}</div>
+                    <div class="goal-meta">${g.done_tasks || 0} done · ${g.pending_tasks || 0} remaining</div>
+                </div>
+                <button class="goal-archive-btn" data-goal-id="${g.id}" title="Archive">&times;</button>
+            </div>
+        `).join('');
+        el.querySelectorAll('.goal-archive-btn').forEach(btn => {
+            btn.addEventListener('click', async (e) => {
+                e.stopPropagation();
+                await api('/goals/' + btn.dataset.goalId, { method: 'DELETE' });
+                toast('Goal archived');
+                loadGoals();
+            });
+        });
+    } catch (e) { /* fail silently */ }
+}
+
+$('#btn-add-goal').addEventListener('click', () => {
+    $('#goal-form').classList.remove('hidden');
+    $('#goal-input').focus();
+});
+
+$('#btn-goal-cancel').addEventListener('click', () => {
+    $('#goal-form').classList.add('hidden');
+    $('#goal-input').value = '';
+});
+
+$('#btn-goal-save').addEventListener('click', async () => {
+    const summary = $('#goal-input').value.trim();
+    if (!summary) return;
+    try {
+        await api('/goals', { method: 'POST', body: JSON.stringify({ summary }) });
+        toast('Goal added');
+        $('#goal-form').classList.add('hidden');
+        $('#goal-input').value = '';
+        loadGoals();
+    } catch (e) {
+        toast('Error adding goal');
+    }
+});
+
+$('#goal-input').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+        e.preventDefault();
+        $('#btn-goal-save').click();
+    }
+});
+
+// ── Daily Intention ──────────────────────────────────────────────
+
+async function loadDailyIntention() {
+    const el = $('#intention-content');
+    if (!el) return;
+    try {
+        const data = await api('/daily/intention');
+        if (data.intention) {
+            const text = data.intention.focus_text || '';
+            el.innerHTML = `<div class="intention-set"><span class="intention-text">${esc(text)}</span>
+                <button id="btn-reset-intention" class="btn-sm" style="margin-left:8px;font-size:0.75rem">Change</button></div>`;
+            $('#btn-reset-intention').addEventListener('click', () => renderIntentionForm(data.top_goals));
+        } else {
+            renderIntentionForm(data.top_goals || []);
+        }
+    } catch (e) { /* fail silently */ }
+}
+
+function renderIntentionForm(topGoals) {
+    const el = $('#intention-content');
+    let goalsHtml = '';
+    if (topGoals.length) {
+        goalsHtml = '<div class="intention-goals">' + topGoals.map(g =>
+            `<button class="intention-goal-btn" data-gid="${g.id}" data-text="${esc(g.summary)}">${esc(g.summary)} (${g.pending} left)</button>`
+        ).join('') + '</div>';
+    }
+    el.innerHTML = `
+        ${goalsHtml}
+        <div class="intention-custom">
+            <input id="intention-text" type="text" placeholder="What's your main focus today?" class="goal-input">
+            <button id="btn-set-intention" class="btn-primary" style="font-size:0.82rem;padding:8px 14px;margin-top:6px">Set Focus</button>
+        </div>`;
+    el.querySelectorAll('.intention-goal-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            $('#intention-text').value = btn.dataset.text;
+        });
+    });
+    $('#btn-set-intention').addEventListener('click', async () => {
+        const text = $('#intention-text').value.trim();
+        if (!text) return;
+        await api('/daily/intention', { method: 'POST', body: JSON.stringify({ focus_text: text }) });
+        toast('Focus set!');
+        loadDailyIntention();
+    });
+}
+
+// ── Weekly Review ────────────────────────────────────────────────
+
+async function loadWeeklyReview() {
+    const el = $('#review-content');
+    if (!el) return;
+    try {
+        const data = await api('/review/weekly');
+        let html = `<div class="review-stats">
+            <div class="review-stat"><span class="review-num">${data.completed_count}</span> completed</div>
+            <div class="review-stat"><span class="review-num">${data.skipped_count}</span> skipped</div>
+            <div class="review-stat"><span class="review-num">${data.goal_task_count}</span> goal-aligned</div>
+        </div>`;
+
+        if (data.productivity_trap) {
+            html += `<div class="review-trap">${esc(data.trap_message)}</div>`;
+        }
+
+        const skipCats = data.skip_categories || {};
+        if (Object.keys(skipCats).length) {
+            html += '<div class="review-skips"><strong>Skip patterns:</strong> ' +
+                Object.entries(skipCats).map(([k,v]) => `${k}: ${v}`).join(', ') + '</div>';
+        }
+
+        el.innerHTML = html;
+    } catch (e) {
+        el.innerHTML = '<p class="text-dim" style="font-size:0.85rem;">Could not load review.</p>';
+    }
 }
 
 // ── Edit Modal ───────────────────────────────────────────────────

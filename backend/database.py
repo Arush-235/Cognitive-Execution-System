@@ -64,7 +64,11 @@ CREATE TABLE IF NOT EXISTS task_history (
 CREATE TABLE IF NOT EXISTS goals (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     summary TEXT NOT NULL,
+    description TEXT,
     cluster TEXT,
+    target_date TEXT,
+    status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','achieved','archived')),
+    priority_rank INTEGER DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -113,6 +117,22 @@ CREATE TABLE IF NOT EXISTS user_persona (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS checkins (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    energy INTEGER NOT NULL CHECK(energy BETWEEN 1 AND 5),
+    focus INTEGER NOT NULL CHECK(focus BETWEEN 1 AND 5),
+    mood TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS onboarding_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    role TEXT NOT NULL CHECK(role IN ('assistant','user')),
+    content TEXT NOT NULL,
+    extracted_data TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 """
 
@@ -171,6 +191,32 @@ async def init_db():
                 "INSERT OR IGNORE INTO tracks (name, color, icon, time_available, allow_cross_track, sort_order) VALUES (?, ?, ?, ?, ?, ?)",
                 (name, color, icon, time_avail, cross, sort),
             )
+        # Migrations: add columns that may not exist in older databases
+        await _run_migrations(db)
         await db.commit()
     finally:
         await db.close()
+
+
+async def _run_migrations(db):
+    """Add columns/tables that were introduced after initial schema."""
+    migrations = [
+        # Phase 3: Thinking task convergence
+        ("items", "thinking_time_budget_minutes", "ALTER TABLE items ADD COLUMN thinking_time_budget_minutes INTEGER DEFAULT 60"),
+        ("items", "thinking_time_spent", "ALTER TABLE items ADD COLUMN thinking_time_spent INTEGER DEFAULT 0"),
+        # Phase 4: Resistance taxonomy
+        ("items", "dominant_skip_reason", "ALTER TABLE items ADD COLUMN dominant_skip_reason TEXT"),
+        ("task_history", "skip_reason_category", "ALTER TABLE task_history ADD COLUMN skip_reason_category TEXT"),
+        # Phase 5: Goal fields
+        ("goals", "description", "ALTER TABLE goals ADD COLUMN description TEXT"),
+        ("goals", "target_date", "ALTER TABLE goals ADD COLUMN target_date TEXT"),
+        ("goals", "status", "ALTER TABLE goals ADD COLUMN status TEXT NOT NULL DEFAULT 'active'"),
+        ("goals", "priority_rank", "ALTER TABLE goals ADD COLUMN priority_rank INTEGER DEFAULT 0"),
+    ]
+    for table, column, sql in migrations:
+        if sql is None:
+            continue
+        try:
+            await db.execute(sql)
+        except Exception:
+            pass  # Column already exists

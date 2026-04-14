@@ -3,6 +3,7 @@ import logging
 import os
 import re
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv, set_key
 
@@ -17,7 +18,7 @@ from pydantic import BaseModel
 from typing import Optional
 
 from backend.database import init_db, get_db
-from backend.ai import parse_input, transcribe_audio, expand_thinking_output
+from backend.ai import parse_input, transcribe_audio, expand_thinking_output, onboarding_interview_step, get_onboarding_first_question
 from backend.priority import compute_priority
 from backend.planner import (
     needs_approval,
@@ -30,6 +31,8 @@ from backend.scheduler import (
     needs_break,
     select_next_task,
     handle_skip,
+    get_system_maturity,
+    SKIP_CATEGORIES,
 )
 
 
@@ -62,6 +65,7 @@ class CompleteInput(BaseModel):
 class OverrideInput(BaseModel):
     item_id: int
     reason: str
+    skip_category: Optional[str] = "not_now"
 
 
 class UpdateItemInput(BaseModel):
@@ -104,11 +108,17 @@ class SetActiveTrackInput(BaseModel):
 
 
 class OnboardingInput(BaseModel):
-    has_routine: bool
-    wake_time: Optional[str] = None
-    work_start: Optional[str] = None
-    work_end: Optional[str] = None
-    sleep_time: Optional[str] = None
+    message: str
+
+
+class OnboardingAudioInput(BaseModel):
+    pass  # Audio handled via UploadFile
+
+
+class CheckinInput(BaseModel):
+    energy: int  # 1-5
+    focus: int   # 1-5
+    mood: Optional[str] = None
 
 
 class SettingsInput(BaseModel):
@@ -141,28 +151,528 @@ async def onboarding_status():
         await db.close()
 
 
-@app.post("/onboarding/submit")
-async def onboarding_submit(body: OnboardingInput):
-    """Save onboarding answers and mark as complete."""
+@app.get("/onboarding/start")
+async def onboarding_start():
+    """Start the adaptive onboarding interview. Returns the first question."""
     db = await get_db()
     try:
-        routine_data = {
-            "has_routine": body.has_routine,
-            "wake_time": body.wake_time,
-            "work_start": body.work_start,
-            "work_end": body.work_end,
-            "sleep_time": body.sleep_time,
+        # Clear any previous onboarding messages (restart)
+        await db.execute("DELETE FROM onboarding_messages")
+        await db.commit()
+
+        result = await get_onboarding_first_question()
+        message = result.get("message", "Tell me a bit about yourself — what does a typical day look like for you?")
+
+        # Store the assistant's first message
+        await db.execute(
+            "INSERT INTO onboarding_messages (role, content) VALUES (?, ?)",
+            ("assistant", message),
+        )
+        await db.commit()
+
+        return {"message": message, "done": False}
+    finally:
+        await db.close()
+
+
+@app.post("/onboarding/message")
+async def onboarding_message(body: OnboardingInput):
+    """Send a message in the onboarding interview. Returns AI response with extracted data."""
+    user_msg = body.message.strip()
+    if not user_msg:
+        raise HTTPException(400, "Empty message")
+
+    db = await get_db()
+    try:
+        # Store user message
+        await db.execute(
+            "INSERT INTO onboarding_messages (role, content) VALUES (?, ?)",
+            ("user", user_msg),
+        )
+
+        # Load conversation history
+        rows = await db.execute_fetchall(
+            "SELECT role, content FROM onboarding_messages ORDER BY id ASC"
+        )
+        history = [{"role": r["role"], "content": r["content"]} for r in rows]
+
+        # Run AI interview step
+        try:
+            result = await onboarding_interview_step(history[:-1], user_msg)
+        except RuntimeError as e:
+            raise HTTPException(502, str(e))
+
+        ai_message = result.get("message", "")
+        extracted = result.get("extracted", {})
+        done = result.get("done", False)
+
+        # Store AI response
+        await db.execute(
+            "INSERT INTO onboarding_messages (role, content, extracted_data) VALUES (?, ?, ?)",
+            ("assistant", ai_message, json.dumps(extracted)),
+        )
+
+        # Process extracted data incrementally
+        await _process_onboarding_extraction(db, extracted)
+
+        # If interview is done, finalize onboarding
+        if done:
+            await _finalize_onboarding(db)
+
+        await db.commit()
+
+        return {
+            "message": ai_message,
+            "done": done,
+            "extracted": extracted,
         }
+    finally:
+        await db.close()
+
+
+@app.post("/onboarding/audio")
+async def onboarding_audio(file: UploadFile = File(...)):
+    """Send a voice message in the onboarding interview."""
+    audio_bytes = await file.read()
+    if len(audio_bytes) == 0:
+        raise HTTPException(400, "Empty audio")
+
+    try:
+        text = await transcribe_audio(audio_bytes, file.filename or "audio.webm")
+    except RuntimeError as e:
+        raise HTTPException(502, str(e))
+    if not text.strip():
+        raise HTTPException(400, "Could not transcribe audio")
+
+    # Delegate to the text message handler
+    body = OnboardingInput(message=text)
+    result = await onboarding_message(body)
+    result["transcript"] = text
+    return result
+
+
+async def _process_onboarding_extraction(db, extracted: dict):
+    """Process incrementally extracted onboarding data into user_persona."""
+    if not extracted:
+        return
+
+    # Routine
+    routine = extracted.get("routine")
+    if routine and isinstance(routine, dict) and any(v for k, v in routine.items() if k != "has_routine"):
         await db.execute(
             "INSERT OR REPLACE INTO user_persona (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
-            ("routine", json.dumps(routine_data)),
+            ("routine", json.dumps(routine)),
+        )
+
+    # Role / user context
+    role = extracted.get("role")
+    if role:
+        await db.execute(
+            "INSERT OR REPLACE INTO user_persona (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+            ("user_context", json.dumps({"role": role, "description": extracted.get("user_context", "")})),
+        )
+
+    # Energy hints
+    hints = extracted.get("energy_hints")
+    if hints and isinstance(hints, list) and len(hints) > 0:
+        # Merge with existing hints
+        existing = await db.execute_fetchall(
+            "SELECT value FROM user_persona WHERE key = 'energy_overrides'"
+        )
+        current = []
+        if existing and existing[0]["value"]:
+            try:
+                current = json.loads(existing[0]["value"])
+            except (json.JSONDecodeError, TypeError):
+                current = []
+        current.extend(hints)
+        await db.execute(
+            "INSERT OR REPLACE INTO user_persona (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+            ("energy_overrides", json.dumps(current)),
+        )
+
+    # Challenge profile
+    challenges = extracted.get("challenge_profile")
+    if challenges and isinstance(challenges, list) and len(challenges) > 0:
+        await db.execute(
+            "INSERT OR REPLACE INTO user_persona (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+            ("challenge_profile", json.dumps(challenges)),
+        )
+
+    # Avoidance patterns
+    avoidance = extracted.get("avoidance_patterns")
+    if avoidance and isinstance(avoidance, list) and len(avoidance) > 0:
+        await db.execute(
+            "INSERT OR REPLACE INTO user_persona (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+            ("avoidance_domains", json.dumps(avoidance)),
+        )
+
+    # Goals
+    goals = extracted.get("goals")
+    if goals and isinstance(goals, list):
+        for g in goals:
+            title = g.get("title", "").strip()
+            if not title:
+                continue
+            # Avoid duplicate goals
+            existing_goal = await db.execute_fetchall(
+                "SELECT id FROM goals WHERE summary = ?", (title,)
+            )
+            if not existing_goal:
+                await db.execute(
+                    "INSERT INTO goals (summary, status, priority_rank) VALUES (?, 'active', ?)",
+                    (title, 1 if g.get("urgency") == "this_week" else 0),
+                )
+
+    # Tasks — pre-seed into the task database
+    tasks = extracted.get("tasks")
+    if tasks and isinstance(tasks, list):
+        for t in tasks:
+            content = t.get("content", "").strip()
+            if not content or len(content) < 3:
+                continue
+            cluster = t.get("cluster", "general")
+            priority_val = {"high": 8.0, "medium": 5.0, "low": 2.0}.get(
+                t.get("estimated_priority", "medium"), 5.0
+            )
+            # Run through full AI parser for proper ADHD metadata
+            try:
+                parsed = await parse_input(content)
+                parsed_tasks = parsed.get("tasks", [])
+                goal_text = parsed.get("goal", "")
+                if parsed_tasks:
+                    await _insert_task_batch(db, parsed_tasks, goal_text)
+            except Exception:
+                # Fallback: insert directly with minimal metadata
+                await db.execute(
+                    """INSERT INTO items (content, layer, type, scope, cluster, status, priority,
+                                          energy_required, duration_minutes, cognitive_load,
+                                          dopamine_profile, initiation_friction, completion_visibility,
+                                          execution_class, complexity_score, sort_order)
+                       VALUES (?, 'operational', 'task', 'local', ?, 'inbox', ?, 'medium', 20,
+                               'medium', 'neutral', 'medium', 'visible', 'linear', 5.0, 0)""",
+                    (content, cluster, priority_val),
+                )
+
+
+async def _finalize_onboarding(db):
+    """Mark onboarding as complete and store the full transcript."""
+    await db.execute(
+        "INSERT OR REPLACE INTO system_state (key, value) VALUES (?, ?)",
+        ("onboarding_complete", "1"),
+    )
+
+    # Store the full transcript for future AI context
+    rows = await db.execute_fetchall(
+        "SELECT role, content FROM onboarding_messages ORDER BY id ASC"
+    )
+    transcript = "\n".join(f"{r['role']}: {r['content']}" for r in rows)
+    await db.execute(
+        "INSERT OR REPLACE INTO user_persona (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+        ("onboarding_transcript", json.dumps(transcript)),
+    )
+
+    # Ensure routine exists (fallback to defaults if not extracted)
+    routine_row = await db.execute_fetchall(
+        "SELECT value FROM user_persona WHERE key = 'routine'"
+    )
+    if not routine_row:
+        await db.execute(
+            "INSERT OR REPLACE INTO user_persona (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+            ("routine", json.dumps({"has_routine": False})),
+        )
+
+
+# ── Check-in ─────────────────────────────────────────────────────
+
+
+@app.post("/checkin")
+async def submit_checkin(body: CheckinInput):
+    """Record a quick energy/focus check-in. Used for state inference."""
+    energy = max(1, min(5, body.energy))
+    focus = max(1, min(5, body.focus))
+
+    db = await get_db()
+    try:
+        await db.execute(
+            "INSERT INTO checkins (energy, focus, mood) VALUES (?, ?, ?)",
+            (energy, focus, body.mood),
+        )
+        await db.commit()
+        energy_label = "low" if energy <= 2 else ("high" if energy >= 4 else "medium")
+        focus_label = "scattered" if focus <= 2 else ("locked_in" if focus >= 4 else "normal")
+        return {
+            "status": "ok",
+            "energy": energy_label,
+            "focus": focus_label,
+        }
+    finally:
+        await db.close()
+
+
+@app.get("/checkin/latest")
+async def get_latest_checkin():
+    """Get the most recent check-in if within 2 hours."""
+    db = await get_db()
+    try:
+        row = await db.execute_fetchall(
+            """SELECT energy, focus, mood, created_at
+               FROM checkins
+               WHERE created_at > datetime('now', '-2 hours')
+               ORDER BY created_at DESC LIMIT 1"""
+        )
+        if row:
+            r = dict(row[0])
+            return {"has_recent": True, **r}
+        return {"has_recent": False}
+    finally:
+        await db.close()
+
+
+@app.get("/skip-categories")
+async def get_skip_categories():
+    """Return available skip reason categories for the frontend."""
+    return {"categories": [
+        {"key": k, **v} for k, v in SKIP_CATEGORIES.items()
+    ]}
+
+
+# ── Goals CRUD ───────────────────────────────────────────────────
+
+
+class GoalInput(BaseModel):
+    summary: str
+    description: Optional[str] = None
+    cluster: Optional[str] = None
+    target_date: Optional[str] = None
+    priority_rank: Optional[int] = 0
+
+
+class GoalUpdateInput(BaseModel):
+    summary: Optional[str] = None
+    description: Optional[str] = None
+    status: Optional[str] = None
+    priority_rank: Optional[int] = None
+    target_date: Optional[str] = None
+
+
+@app.get("/goals")
+async def get_goals():
+    """Return all active goals with linked task counts."""
+    db = await get_db()
+    try:
+        rows = await db.execute_fetchall(
+            """SELECT g.*,
+                      (SELECT COUNT(*) FROM items WHERE goal_id = g.id AND status != 'done') AS pending_tasks,
+                      (SELECT COUNT(*) FROM items WHERE goal_id = g.id AND status = 'done') AS done_tasks
+               FROM goals g
+               WHERE g.status = 'active'
+               ORDER BY g.priority_rank DESC, g.created_at ASC"""
+        )
+        return {"goals": [dict(r) for r in rows]}
+    finally:
+        await db.close()
+
+
+@app.post("/goals")
+async def create_goal(body: GoalInput):
+    """Create a new goal."""
+    if not body.summary.strip():
+        raise HTTPException(400, "Goal summary is required")
+    db = await get_db()
+    try:
+        cursor = await db.execute(
+            """INSERT INTO goals (summary, description, cluster, target_date, status, priority_rank)
+               VALUES (?, ?, ?, ?, 'active', ?)""",
+            (body.summary.strip(), body.description, body.cluster, body.target_date, body.priority_rank or 0),
+        )
+        await db.commit()
+        return {"status": "created", "goal_id": cursor.lastrowid}
+    finally:
+        await db.close()
+
+
+@app.patch("/goals/{goal_id}")
+async def update_goal(goal_id: int, body: GoalUpdateInput):
+    """Update a goal."""
+    db = await get_db()
+    try:
+        row = await db.execute_fetchall("SELECT * FROM goals WHERE id = ?", (goal_id,))
+        if not row:
+            raise HTTPException(404, "Goal not found")
+
+        updates = {}
+        if body.summary is not None:
+            updates["summary"] = body.summary.strip()
+        if body.description is not None:
+            updates["description"] = body.description
+        if body.status is not None:
+            if body.status not in ("active", "achieved", "archived"):
+                raise HTTPException(400, "Invalid goal status")
+            updates["status"] = body.status
+        if body.priority_rank is not None:
+            updates["priority_rank"] = body.priority_rank
+        if body.target_date is not None:
+            updates["target_date"] = body.target_date
+
+        if not updates:
+            raise HTTPException(400, "No fields to update")
+
+        set_clause = ", ".join(f"{k} = ?" for k in updates)
+        values = list(updates.values()) + [goal_id]
+        await db.execute(f"UPDATE goals SET {set_clause} WHERE id = ?", values)
+        await db.commit()
+        return {"status": "updated", "goal_id": goal_id}
+    finally:
+        await db.close()
+
+
+@app.delete("/goals/{goal_id}")
+async def delete_goal(goal_id: int):
+    """Archive a goal (soft delete)."""
+    db = await get_db()
+    try:
+        row = await db.execute_fetchall("SELECT * FROM goals WHERE id = ?", (goal_id,))
+        if not row:
+            raise HTTPException(404, "Goal not found")
+        await db.execute("UPDATE goals SET status = 'archived' WHERE id = ?", (goal_id,))
+        await db.commit()
+        return {"status": "archived", "goal_id": goal_id}
+    finally:
+        await db.close()
+
+
+# ── Daily Intention + Weekly Review ──────────────────────────────
+
+
+@app.get("/daily/intention")
+async def get_daily_intention():
+    """Return today's intended focus goal and suggested first task."""
+    db = await get_db()
+    try:
+        row = await db.execute_fetchall(
+            "SELECT value FROM system_state WHERE key = 'daily_intention_date'"
+        )
+        today = datetime.now().strftime("%Y-%m-%d")
+
+        intention = None
+        if row and row[0]["value"] == today:
+            intent_row = await db.execute_fetchall(
+                "SELECT value FROM system_state WHERE key = 'daily_intention'"
+            )
+            if intent_row:
+                intention = json.loads(intent_row[0]["value"])
+
+        goals = await db.execute_fetchall(
+            """SELECT g.id, g.summary,
+                      (SELECT COUNT(*) FROM items WHERE goal_id = g.id AND status != 'done') AS pending
+               FROM goals g
+               WHERE g.status = 'active'
+               ORDER BY g.priority_rank DESC LIMIT 3"""
+        )
+
+        return {
+            "date": today,
+            "intention": intention,
+            "top_goals": [dict(g) for g in goals],
+        }
+    finally:
+        await db.close()
+
+
+class IntentionInput(BaseModel):
+    goal_id: Optional[int] = None
+    focus_text: Optional[str] = None
+
+
+@app.post("/daily/intention")
+async def set_daily_intention(body: IntentionInput):
+    """Set today's focus intention."""
+    db = await get_db()
+    try:
+        today = datetime.now().strftime("%Y-%m-%d")
+        intention = {
+            "goal_id": body.goal_id,
+            "focus_text": body.focus_text,
+        }
+        await db.execute(
+            "INSERT OR REPLACE INTO system_state (key, value) VALUES (?, ?)",
+            ("daily_intention", json.dumps(intention)),
         )
         await db.execute(
             "INSERT OR REPLACE INTO system_state (key, value) VALUES (?, ?)",
-            ("onboarding_complete", "1"),
+            ("daily_intention_date", today),
         )
         await db.commit()
-        return {"status": "ok", "routine": routine_data}
+        return {"status": "ok", "intention": intention}
+    finally:
+        await db.close()
+
+
+@app.get("/review/weekly")
+async def get_weekly_review():
+    """Return a comprehensive weekly review with goal progress and patterns."""
+    db = await get_db()
+    try:
+        completed = await db.execute_fetchall(
+            """SELECT i.content, i.cluster, i.goal_id, i.duration_minutes, i.cognitive_load,
+                      th.elapsed_seconds, g.summary as goal_summary
+               FROM task_history th
+               JOIN items i ON th.item_id = i.id
+               LEFT JOIN goals g ON i.goal_id = g.id
+               WHERE th.event = 'completed'
+                 AND th.created_at >= date('now', 'weekday 0', '-6 days')
+               ORDER BY th.created_at DESC"""
+        )
+
+        skipped = await db.execute_fetchall(
+            """SELECT i.content, i.cluster, th.skip_reason_category
+               FROM task_history th
+               JOIN items i ON th.item_id = i.id
+               WHERE th.event = 'skipped'
+                 AND th.created_at >= date('now', 'weekday 0', '-6 days')
+               ORDER BY th.created_at DESC"""
+        )
+
+        goals = await db.execute_fetchall(
+            """SELECT g.id, g.summary, g.status, g.priority_rank,
+                      (SELECT COUNT(*) FROM items WHERE goal_id = g.id AND status = 'done') AS done_tasks,
+                      (SELECT COUNT(*) FROM items WHERE goal_id = g.id AND status != 'done') AS pending_tasks
+               FROM goals g
+               WHERE g.status = 'active'
+               ORDER BY g.priority_rank DESC"""
+        )
+
+        skip_categories = {}
+        for s in skipped:
+            cat = dict(s).get("skip_reason_category", "unknown")
+            skip_categories[cat] = skip_categories.get(cat, 0) + 1
+
+        completed_list = [dict(c) for c in completed]
+        goal_tasks = [c for c in completed_list if c.get("goal_id")]
+        non_goal_tasks = [c for c in completed_list if not c.get("goal_id")]
+
+        productivity_trap = False
+        trap_message = None
+        if len(completed_list) >= 5 and len(goal_tasks) < 2:
+            productivity_trap = True
+            trap_message = (
+                f"You completed {len(completed_list)} tasks this week, but only "
+                f"{len(goal_tasks)} were linked to your goals. Consider focusing "
+                f"more on goal-aligned work."
+            )
+
+        return {
+            "completed": completed_list,
+            "completed_count": len(completed_list),
+            "skipped_count": len(skipped),
+            "skip_categories": skip_categories,
+            "goals": [dict(g) for g in goals],
+            "goal_task_count": len(goal_tasks),
+            "non_goal_task_count": len(non_goal_tasks),
+            "productivity_trap": productivity_trap,
+            "trap_message": trap_message,
+        }
     finally:
         await db.close()
 
@@ -586,14 +1096,35 @@ async def get_next():
             "SELECT value FROM user_persona WHERE key = 'routine'"
         )
         if routine_row and routine_row[0]["value"]:
-            import json as _json
             try:
-                routine = _json.loads(routine_row[0]["value"])
+                routine = json.loads(routine_row[0]["value"])
             except Exception:
                 routine = None
 
-        # Infer user state
-        user_state = infer_user_state(completed_recently, history_events, routine=routine)
+        # Load recent check-in for state inference
+        checkin = None
+        checkin_row = await db.execute_fetchall(
+            """SELECT energy, focus, mood, created_at
+               FROM checkins
+               WHERE created_at > datetime('now', '-2 hours')
+               ORDER BY created_at DESC LIMIT 1"""
+        )
+        if checkin_row:
+            checkin = {"has_recent": True, **dict(checkin_row[0])}
+
+        # Infer user state (two-tier: check-in or behavioral)
+        user_state = infer_user_state(
+            completed_recently, history_events, routine=routine, checkin=checkin
+        )
+
+        # System maturity gates features progressively
+        maturity = await get_system_maturity(db)
+
+        # Active goal IDs for goal-aligned scoring
+        goal_rows = await db.execute_fetchall(
+            "SELECT id FROM goals WHERE status = 'active'"
+        )
+        active_goal_ids = {r["id"] for r in goal_rows} if goal_rows else set()
 
         # Check if break is needed
         break_info = needs_break(user_state)
@@ -606,7 +1137,11 @@ async def get_next():
             }
 
         # Run scheduling engine — returns scored sequence
-        result = select_next_task(items, user_state)
+        result = select_next_task(
+            items, user_state,
+            maturity_level=maturity["level"],
+            active_goal_ids=active_goal_ids,
+        )
         sequence = result.get("sequence", [])
 
         if not sequence:
@@ -640,6 +1175,7 @@ async def get_next():
             "options": options,
             "big_picture": goal_context,
             "user_state": user_state,
+            "maturity": maturity,
         }
 
         if active_track:
@@ -745,6 +1281,15 @@ async def complete_task(body: CompleteInput):
             "UPDATE items SET status = 'done' WHERE id = ?", (body.item_id,)
         )
 
+        # Track thinking time budget for convergence
+        if is_thinking and body.elapsed_seconds:
+            current_spent = item.get("thinking_time_spent", 0) or 0
+            new_spent = current_spent + (body.elapsed_seconds // 60)
+            await db.execute(
+                "UPDATE items SET thinking_time_spent = ? WHERE id = ?",
+                (new_spent, body.item_id),
+            )
+
         # Log completion to task_history
         from backend.scheduler import infer_time_of_day
         tod = infer_time_of_day()
@@ -793,7 +1338,7 @@ async def complete_task(body: CompleteInput):
 
 @app.post("/override")
 async def override_task(body: OverrideInput):
-    """Skip the current task with a reason. Tracks avoidance patterns."""
+    """Skip the current task with a categorized reason. Tracks avoidance patterns."""
     if not body.reason.strip():
         raise HTTPException(400, "Reason is required to skip a task")
 
@@ -807,26 +1352,28 @@ async def override_task(body: OverrideInput):
 
         existing = dict(row[0])
 
-        # Process skip through avoidance handler
-        skip_result = handle_skip(existing)
+        # Process skip through categorized avoidance handler
+        skip_category = body.skip_category or "not_now"
+        skip_result = handle_skip(existing, skip_category=skip_category)
 
-        # Update item with skip tracking
-        new_content = f"{existing['content']} [SKIPPED: {body.reason}]"
+        # Update item with skip tracking — DO NOT mutate content
         await db.execute(
-            """UPDATE items SET status = 'backlog', content = ?,
-               skip_count = ?, resistance_flag = ?
+            """UPDATE items SET status = 'backlog',
+               skip_count = ?, resistance_flag = ?, dominant_skip_reason = ?
                WHERE id = ?""",
-            (new_content, skip_result["skip_count"],
-             skip_result["resistance_flag"], body.item_id),
+            (skip_result["skip_count"],
+             skip_result["resistance_flag"],
+             skip_result.get("dominant_skip_reason", skip_category),
+             body.item_id),
         )
 
-        # Log skip to task_history
+        # Log skip to task_history with category
         from backend.scheduler import infer_time_of_day
         tod = infer_time_of_day()
         await db.execute(
-            """INSERT INTO task_history (item_id, event, time_of_day)
-               VALUES (?, 'skipped', ?)""",
-            (body.item_id, tod),
+            """INSERT INTO task_history (item_id, event, time_of_day, skip_reason_category)
+               VALUES (?, 'skipped', ?, ?)""",
+            (body.item_id, tod, skip_category),
         )
 
         state = await db.execute_fetchall(
@@ -843,9 +1390,10 @@ async def override_task(body: OverrideInput):
 
     next_data = await get_next()
 
-    # Attach avoidance guidance if relevant
-    if skip_result.get("guidance") == "avoidance_detected":
+    # Attach intervention if relevant
+    if skip_result.get("suggestion"):
         next_data["avoidance_warning"] = skip_result["suggestion"]
+        next_data["intervention_type"] = skip_result.get("guidance", "avoidance_detected")
 
     return next_data
 

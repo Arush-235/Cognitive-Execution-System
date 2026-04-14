@@ -11,6 +11,17 @@ Implements Section 21 of the CES spec:
 
 from datetime import datetime, timedelta
 from typing import Optional
+import json
+
+# ── Skip Taxonomy ─────────────────────────────────────────────────
+
+SKIP_CATEGORIES = {
+    "not_now": {"label": "Not right now", "emoji": "⏰", "weight": 0.0},
+    "too_hard": {"label": "Feels too hard", "emoji": "🧱", "weight": -0.5},
+    "unclear": {"label": "Not sure what to do", "emoji": "❓", "weight": -0.3},
+    "boring": {"label": "Too boring", "emoji": "😴", "weight": -0.2},
+    "anxious": {"label": "Makes me anxious", "emoji": "😰", "weight": -1.0},
+}
 
 # ── Circadian Strategy Map ────────────────────────────────────────
 
@@ -47,10 +58,15 @@ def infer_user_state(
     history_events: list[dict],
     now: Optional[datetime] = None,
     routine: Optional[dict] = None,
+    checkin: Optional[dict] = None,
 ) -> dict:
     """Infer the user's current cognitive state from observable signals.
 
-    Returns: {energy, focus, momentum, time_of_day, work_minutes_since_break}
+    Two-tier model:
+    - If a recent check-in exists, use it as ground truth (high confidence)
+    - Otherwise, infer from behavioral signals (lower confidence)
+
+    Returns: {energy, focus, momentum, time_of_day, work_minutes_since_break, confidence}
     """
     tod = infer_time_of_day(now)
     current_hour = (now or datetime.now()).hour
@@ -69,32 +85,51 @@ def infer_user_state(
     else:
         momentum = "high"
 
-    # --- Energy: routine-aware circadian model ---
-    if routine and routine.get("has_routine"):
-        energy = _routine_energy(current_hour, routine)
+    # --- Check-in path (high confidence) ---
+    if checkin and checkin.get("has_recent"):
+        ci_energy = checkin.get("energy", 3)
+        ci_focus = checkin.get("focus", 3)
+        energy = "low" if ci_energy <= 2 else ("high" if ci_energy >= 4 else "medium")
+        focus = "scattered" if ci_focus <= 2 else ("locked_in" if ci_focus >= 4 else "normal")
+        confidence = 0.9
     else:
-        tod_energy = {"morning": "high", "afternoon": "medium", "evening": "low", "night": "low"}
-        energy = tod_energy[tod]
+        # --- Behavioral inference path (lower confidence) ---
+        confidence = 0.4
 
-    # If they just completed a high cognitive task, downgrade energy slightly
-    if recent_completions:
-        last = recent_completions[-1]
-        if last.get("user_energy"):
-            energy = last["user_energy"]  # trust self-reported
+        # Energy: routine-aware circadian model
+        if routine and routine.get("has_routine"):
+            energy = _routine_energy(current_hour, routine)
+            confidence += 0.1
+        else:
+            tod_energy = {"morning": "high", "afternoon": "medium", "evening": "low", "night": "low"}
+            energy = tod_energy[tod]
 
-    # --- Focus: infer from skip/pause patterns ---
-    recent_skips = sum(1 for e in history_events if e.get("event") == "skipped")
-    recent_pauses = sum(1 for e in history_events if e.get("event") == "paused")
+        # If they just completed a high cognitive task, downgrade energy slightly
+        if recent_completions:
+            last = recent_completions[-1]
+            if last.get("user_energy"):
+                energy = last["user_energy"]
+                confidence += 0.15
 
-    if recent_skips >= 2 or recent_pauses >= 3:
-        focus = "scattered"
-    elif completion_count >= 2 and recent_skips == 0:
-        focus = "locked_in"
-    else:
-        focus = "normal"
+        # Focus: infer from skip/pause patterns
+        recent_skips = sum(1 for e in history_events if e.get("event") == "skipped")
+        recent_pauses = sum(1 for e in history_events if e.get("event") == "paused")
 
-    # --- Work minutes since last break ---
+        if recent_skips >= 2 or recent_pauses >= 3:
+            focus = "scattered"
+            confidence += 0.1  # strong signal
+        elif completion_count >= 2 and recent_skips == 0:
+            focus = "locked_in"
+            confidence += 0.15
+        else:
+            focus = "normal"
+
+    # --- Energy decay: degrade energy after long work ---
     work_minutes = _estimate_work_minutes(history_events, now)
+    if work_minutes >= 45 and energy == "high":
+        energy = "medium"
+    elif work_minutes >= 75 and energy == "medium":
+        energy = "low"
 
     return {
         "energy": energy,
@@ -102,6 +137,7 @@ def infer_user_state(
         "momentum": momentum,
         "time_of_day": tod,
         "work_minutes_since_break": work_minutes,
+        "confidence": min(round(confidence, 2), 1.0),
     }
 
 
@@ -209,12 +245,41 @@ def needs_break(user_state: dict) -> Optional[dict]:
     return None
 
 
+# ── System Maturity ───────────────────────────────────────────────
+
+async def get_system_maturity(db) -> dict:
+    """Compute system maturity level based on usage history.
+
+    Levels:
+    - cold (0-2 completions): minimal features, gentle start
+    - warming (3-9): basic scheduling active
+    - stable (10-24): full ADHD rules engaged
+    - mature (25+): advanced features (strategic scoring, interventions)
+    """
+    row = await db.execute_fetchall(
+        "SELECT COUNT(*) as cnt FROM task_history WHERE event = 'completed'"
+    )
+    count = row[0]["cnt"] if row else 0
+
+    if count < 3:
+        level = "cold"
+    elif count < 10:
+        level = "warming"
+    elif count < 25:
+        level = "stable"
+    else:
+        level = "mature"
+
+    return {"level": level, "completions": count}
+
+
 # ── ADHD-Aware Task Scoring ──────────────────────────────────────
 
-def score_task(item: dict, user_state: dict) -> float:
+def score_task(item: dict, user_state: dict, goal_ids: set = None) -> float:
     """
-    ADHD-aware scoring function per Section 21.5:
-    score = priority_weight + energy_match + dopamine_alignment - friction_penalty + momentum_bonus
+    ADHD-aware scoring function:
+    score = priority_weight + energy_match + dopamine_alignment - friction_penalty
+            + momentum_bonus + avoidance_adj + goal_alignment + confidence_damping
     """
     # 1. Priority weight (0-4 based on layer)
     priority_weight = LAYER_WEIGHT.get(item.get("layer", "technical"), 1.0)
@@ -237,17 +302,50 @@ def score_task(item: dict, user_state: dict) -> float:
     # 5. Momentum bonus (0-2)
     momentum_bonus = _compute_momentum_bonus(item, user_state)
 
-    # 6. Avoidance penalty — tasks skipped many times get urgency bump but friction penalty
+    # 6. Avoidance: category-aware penalty (replaces blanket penalty)
     skip_count = item.get("skip_count", 0)
-    avoidance_adj = 0
+    dominant_reason = item.get("dominant_skip_reason", "")
+    avoidance_adj = _compute_avoidance_adj(skip_count, dominant_reason)
+
+    # 7. Goal alignment: boost tasks linked to active goals
+    goal_alignment = 0.0
+    if goal_ids and item.get("goal_id") and item["goal_id"] in goal_ids:
+        goal_alignment = 1.0
+
+    # 8. Confidence damping: when confidence is low, compress differences
+    confidence = user_state.get("confidence", 0.5)
+    raw_score = (priority_weight + energy_match + dopamine_alignment
+                 - friction_penalty + momentum_bonus + avoidance_adj + goal_alignment)
+
+    # Thinking convergence: penalize thinking tasks near their time budget
+    if item.get("type") == "thinking":
+        budget = item.get("thinking_time_budget_minutes", 60) or 60
+        spent = item.get("thinking_time_spent", 0) or 0
+        ratio = spent / budget if budget > 0 else 0
+        if ratio >= 1.0:
+            raw_score -= 3.0  # force escalation
+        elif ratio >= 0.75:
+            raw_score -= 1.0  # gentle push
+
+    # Dampen towards mean when confidence is low
+    mean_score = 3.0  # approximate center
+    damped_score = mean_score + (raw_score - mean_score) * confidence
+
+    return round(damped_score, 2)
+
+
+def _compute_avoidance_adj(skip_count: int, dominant_reason: str) -> float:
+    """Category-aware avoidance scoring."""
+    if skip_count == 0:
+        return 0.0
+
+    base = SKIP_CATEGORIES.get(dominant_reason, {}).get("weight", -0.3)
+
     if skip_count >= 3:
-        avoidance_adj = -1.5  # strongly penalized until decomposed
+        return base * 2.0  # strongly penalized
     elif skip_count >= 2:
-        avoidance_adj = -0.5
-
-    score = priority_weight + energy_match + dopamine_alignment - friction_penalty + momentum_bonus + avoidance_adj
-
-    return round(score, 2)
+        return base
+    return 0.0
 
 
 def _compute_energy_match(item: dict, user_state: dict) -> float:
@@ -351,17 +449,16 @@ def select_next_task(
     items: list[dict],
     user_state: dict,
     completed_clusters: set[str] = None,
+    maturity_level: str = "stable",
+    active_goal_ids: set = None,
 ) -> dict:
     """Apply ADHD scheduling rules to select the best next task.
 
-    Rules (in priority):
-    1. Start Bias: if momentum=none → low friction, quick reward, ≤20 min
-    2. Momentum Mode: if tasks completed → escalate gradually
-    3. Anti-Avoidance: resistance_flag items get deferred unless decomposed
-    4. Energy Matching: enforce task/energy alignment
-    5. Dopamine Sequencing: quick win → meaningful → optional reward
-    6. Thinking Task Rules: max 1 thinking at a time, high energy + morning/peak only
-    7. Dopamine Sandwich: quick win before thinking, execution task after
+    Rules (gated by maturity):
+    Always:  Start Bias, Energy Matching
+    warming: + Momentum Mode, Dopamine Sequencing
+    stable:  + Anti-Avoidance, Thinking Task Rules
+    mature:  + Goal Alignment, Interventions, Strategic Scoring
 
     Returns: {
         selected: item,
@@ -379,6 +476,7 @@ def select_next_task(
     focus = user_state.get("focus", "normal")
     tod = user_state.get("time_of_day", "afternoon")
     circadian = CIRCADIAN_MAP.get(tod, CIRCADIAN_MAP["afternoon"])
+    goal_ids = active_goal_ids or set()
 
     # Separate thinking tasks from regular tasks
     thinking_tasks = [i for i in items if i.get("type") == "thinking"]
@@ -412,10 +510,11 @@ def select_next_task(
     # Score all items
     scored = []
     for item in items:
-        # Skip thinking tasks if not eligible
+        # Skip thinking tasks if not eligible (stable+ only)
         if item.get("type") == "thinking" and not thinking_eligible:
-            continue
-        s = score_task(item, user_state)
+            if maturity_level in ("stable", "mature"):
+                continue
+        s = score_task(item, user_state, goal_ids=goal_ids)
 
         # Thinking task scoring adjustments
         if item.get("type") == "thinking":
@@ -435,7 +534,7 @@ def select_next_task(
         scored = [(score_task(i, user_state), i) for i in items]
         scored.sort(key=lambda x: x[0], reverse=True)
 
-    # RULE 1: Start Bias — when momentum is none, heavily filter
+    # RULE 1: Start Bias — when momentum is none, heavily filter (always active)
     if momentum == "none":
         starters = [
             (s, i) for s, i in scored
@@ -446,15 +545,14 @@ def select_next_task(
         if starters:
             scored = starters
 
-    # RULE 3: Anti-Avoidance — skip resistance-flagged items unless they're top priority
-    if scored[0][1].get("resistance_flag") and len(scored) > 1:
-        # Only allow if it's dramatically higher scored
+    # RULE 3: Anti-Avoidance — skip resistance-flagged items (stable+ only)
+    if maturity_level in ("stable", "mature") and scored and scored[0][1].get("resistance_flag") and len(scored) > 1:
         if scored[0][0] - scored[1][0] < 2.0:
             non_resistant = [(s, i) for s, i in scored if not i.get("resistance_flag")]
             if non_resistant:
                 scored = non_resistant
 
-    # RULE 4: Energy Matching — if user energy is low, cap task demand
+    # RULE 4: Energy Matching — if user energy is low, cap task demand (always active)
     if energy == "low":
         low_demand = [
             (s, i) for s, i in scored
@@ -572,42 +670,100 @@ def _find_recovery_task(
 
 # ── Avoidance Handling ────────────────────────────────────────────
 
-def handle_skip(item: dict) -> dict:
-    """Process a skipped task and return updated fields + guidance.
+def handle_skip(item: dict, skip_category: str = "not_now") -> dict:
+    """Process a skipped task with categorized reason.
 
-    Rules:
-    - skip_count increments
-    - If skip_count >= 2: set resistance_flag
-    - If resistance_flag: suggest decomposition or friction reduction
+    Returns updated fields, guidance, and category-specific interventions.
     """
     skip_count = item.get("skip_count", 0) + 1
     resistance = item.get("resistance_flag", False) or (skip_count >= 2)
 
+    # Validate category
+    if skip_category not in SKIP_CATEGORIES:
+        skip_category = "not_now"
+
     result = {
         "skip_count": skip_count,
         "resistance_flag": resistance,
+        "skip_category": skip_category,
+        "dominant_skip_reason": skip_category,
     }
 
-    if resistance:
-        result["guidance"] = "avoidance_detected"
-        if item.get("type") == "thinking":
-            result["suggestion"] = (
-                f"You've skipped this thinking task {skip_count} times. "
-                f"Try a reduced version: 15 min, just write 3 bullet points. "
-                f"Or discard it if it's no longer relevant."
-            )
-            result["reduce_scope"] = True
-        else:
-            result["suggestion"] = (
-                f"You've skipped this {skip_count} times. "
-                f"Consider: break it into a 10-min starter step, "
-                f"or change when/how you'd approach it."
-            )
+    # Category-specific interventions
+    intervention = get_resistance_intervention(item, skip_count, skip_category)
+    if intervention:
+        result["guidance"] = intervention["type"]
+        result["suggestion"] = intervention["message"]
     elif skip_count == 1:
         result["guidance"] = "normal_skip"
         result["suggestion"] = None
 
     return result
+
+
+def get_resistance_intervention(
+    item: dict, skip_count: int, category: str
+) -> Optional[dict]:
+    """Return a targeted intervention based on skip category and count."""
+    if skip_count < 2:
+        return None
+
+    is_thinking = item.get("type") == "thinking"
+    content_short = (item.get("content", "")[:40] + "...") if len(item.get("content", "")) > 40 else item.get("content", "")
+
+    interventions = {
+        "too_hard": {
+            "type": "decompose",
+            "message": (
+                f"'{content_short}' feels too hard. "
+                f"Try: break into a 10-minute starter step, or lower the bar — "
+                f"what's the smallest slice you could do right now?"
+            ),
+        },
+        "unclear": {
+            "type": "clarify",
+            "message": (
+                f"'{content_short}' is unclear. "
+                f"Try: spend 5 minutes just writing down what you think the first step is. "
+                f"Or rephrase it as a question to answer."
+            ),
+        },
+        "boring": {
+            "type": "gamify",
+            "message": (
+                f"'{content_short}' feels boring. "
+                f"Try: set a 15-minute timer and race yourself. "
+                f"Or pair it with music/a podcast."
+            ),
+        },
+        "anxious": {
+            "type": "comfort",
+            "message": (
+                f"'{content_short}' makes you anxious. "
+                f"That's okay. Try: imagine the worst realistic outcome — is it survivable? "
+                f"Or just do the first 2 minutes and give yourself permission to stop."
+            ),
+        },
+        "not_now": {
+            "type": "reschedule" if skip_count < 3 else "avoidance_detected",
+            "message": (
+                f"You've deferred '{content_short}' {skip_count} times. "
+                f"Is this actually important? If yes, when would be the right time?"
+            ),
+        },
+    }
+
+    if is_thinking and category in ("too_hard", "unclear"):
+        return {
+            "type": "reduce_scope",
+            "message": (
+                f"This thinking task has been skipped {skip_count} times. "
+                f"Try: 15 min, just 3 bullet points. "
+                f"Or convert it to a concrete action step."
+            ),
+        }
+
+    return interventions.get(category)
 
 
 def _find_quick_win(regular_tasks: list[dict], exclude: dict) -> Optional[dict]:

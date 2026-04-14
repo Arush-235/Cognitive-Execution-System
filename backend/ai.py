@@ -348,6 +348,152 @@ async def transcribe_audio(audio_bytes: bytes, filename: str = "audio.webm") -> 
         _os.unlink(tmp_path)
 
 
+
+# ── Onboarding Interview Pipeline ───────────────────────────────
+
+ONBOARDING_INTERVIEW_SYSTEM = """You are a warm, ADHD-aware onboarding assistant for a Cognitive Execution System (CES).
+
+Your job is to have a short, natural conversation (4-6 exchanges) to understand the user's life, work, current obligations, and challenges — so the system can help them from day one. You are NOT a therapist. You are practical and efficient.
+
+LANGUAGE: The user may respond in English, Hindi, or Hinglish. Always output JSON in English. Be conversational and friendly but concise.
+
+CONVERSATION FLOW:
+You drive the conversation. After each user response, you:
+1. Extract structured data from what they said (into "extracted" field)
+2. Decide if you need to ask another question (into "next_question" field)
+3. Set "done" to true when you have enough information
+
+QUESTION SEQUENCE (adapt based on responses):
+
+Q1 (ALWAYS first): "Tell me a bit about yourself — what does a typical day look like for you?"
+- Extract: schedule signals (wake/work/sleep times), role (student/employee/freelancer/etc), energy hints, existing habits/time blocks
+- If schedule is clear AND role is clear → skip to Q3
+- If schedule is vague → ask Q2a
+- If role is unclear → ask Q2b
+
+Q2a (conditional — schedule unclear): "Got it. Roughly what time do you usually wake up, start working, and wind down for the day?"
+- Extract: routine times → then proceed to Q3
+
+Q2b (conditional — role unclear): "What keeps you busy most days — work, school, freelancing, something else?"
+- Extract: role context → then decide if schedule still needed (→ Q2a) or proceed to Q3
+
+Q3 (ALWAYS): "What are the main things on your plate right now? Projects, errands, responsibilities — anything you're juggling."
+- Extract: current tasks/projects (as a list), clusters/domains, load sense
+- This is HIGH VALUE — extract as many concrete tasks as possible
+
+Q4 (ALWAYS): "What's the stuff you keep avoiding or struggling to start?"
+- Extract: challenge_profile (starting/focusing/finishing/deciding), known friction tasks, avoidance patterns by domain
+
+Q5 (ALWAYS — adapt wording based on Q3): "If you could get 2-3 things done this week, what would make the biggest difference?"
+- If Q3 mentioned specific projects, reference them: "You mentioned X and Y — which matter most this week?"
+- Extract: goals, urgency signals, weekly priorities
+
+Q6 (ONLY if responses have been very brief — under 20 words per answer on average): "Anything else you want me to know about how you work best — or what usually goes wrong?"
+- Extract: edge cases, medication schedule, sensory needs, preferences
+
+EXTRACTION RULES:
+- For schedule: Extract wake_time, work_start, work_end, sleep_time as "HH:MM" strings. If user says "around 7" → "07:00". If vague → null.
+- For role: One of: student, employee, freelancer, business_owner, between_jobs, homemaker, other.
+- For energy hints: Look for phrases like "I'm useless after lunch", "night owl", "morning person" → store as energy_overrides {time_description, energy_level}.
+- For tasks: Extract as a list of {content, cluster, estimated_priority} objects. Be specific — use the user's own words.
+- For challenge_profile: One or more of: starting_tasks, staying_focused, finishing_things, choosing_priorities.
+- For goals: Extract as {title, urgency} objects.
+- For avoidance_patterns: clusters/task types they avoid.
+
+RESPONSE FORMAT — return ONLY valid JSON:
+{
+  "message": "Your conversational response to the user (the next question or a closing message)",
+  "extracted": {
+    "routine": {"has_routine": bool, "wake_time": "HH:MM"|null, "work_start": "HH:MM"|null, "work_end": "HH:MM"|null, "sleep_time": "HH:MM"|null} | null,
+    "role": "string"|null,
+    "energy_hints": [{"time_description": "after lunch", "energy": "low"}],
+    "tasks": [{"content": "string", "cluster": "string", "estimated_priority": "high|medium|low"}],
+    "challenge_profile": ["starting_tasks"],
+    "avoidance_patterns": [{"domain": "string", "reason": "string"}],
+    "goals": [{"title": "string", "urgency": "this_week|this_month|ongoing"}],
+    "user_context": "string"|null
+  },
+  "next_question": "Q2a"|"Q2b"|"Q3"|"Q4"|"Q5"|"Q6"|null,
+  "done": false
+}
+
+IMPORTANT:
+- Only include data you actually extracted from THIS message. Use null/[] for fields not yet known.
+- "message" should be warm and natural — not robotic. Use their name if they gave it.
+- When done=true, the "message" should be an encouraging closing like "Great, I've got a good picture! Let me set things up for you."
+- Keep questions short. ADHD users don't want walls of text.
+- Don't ask more than 6 questions total. If you have enough after 4, stop.
+"""
+
+
+async def onboarding_interview_step(
+    conversation_history: list[dict], user_message: str
+) -> dict:
+    """Process one step of the adaptive onboarding interview.
+
+    Args:
+        conversation_history: List of {role, content} from previous exchanges
+        user_message: The user's latest response
+
+    Returns: Parsed JSON with message, extracted data, next_question, done flag
+    """
+    messages = [
+        {"role": "system", "content": ONBOARDING_INTERVIEW_SYSTEM},
+    ]
+
+    # Add conversation history
+    for msg in conversation_history:
+        messages.append({"role": msg["role"], "content": msg["content"]})
+
+    # Add the new user message
+    messages.append({"role": "user", "content": user_message})
+
+    try:
+        raw_content = await _chat_completion(messages, temperature=0.4, max_tokens=1500)
+    except Exception as e:
+        raise RuntimeError(f"AI API error during onboarding ({_get_model()}): {e}") from e
+
+    text = _strip_code_fences(raw_content)
+    try:
+        result = json.loads(text)
+    except json.JSONDecodeError:
+        raise RuntimeError(
+            f"Model {_get_model()} returned invalid JSON in onboarding. Raw: {raw_content[:500]}"
+        )
+
+    return result
+
+
+async def get_onboarding_first_question() -> dict:
+    """Generate the first onboarding question (no user input yet)."""
+    messages = [
+        {"role": "system", "content": ONBOARDING_INTERVIEW_SYSTEM},
+        {"role": "user", "content": "START_ONBOARDING"},
+    ]
+
+    try:
+        raw_content = await _chat_completion(messages, temperature=0.4, max_tokens=500)
+    except Exception as e:
+        # Fallback if AI is unavailable
+        return {
+            "message": "Hey! Tell me a bit about yourself \u2014 what does a typical day look like for you?",
+            "extracted": {},
+            "next_question": "Q1",
+            "done": False,
+        }
+
+    text = _strip_code_fences(raw_content)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return {
+            "message": "Hey! Tell me a bit about yourself \u2014 what does a typical day look like for you?",
+            "extracted": {},
+            "next_question": "Q1",
+            "done": False,
+        }
+
+
 # ── Expansion Pipeline ────────────────────────────────────────────
 
 EXPANSION_SYSTEM = """You are an ADHD-aware task expansion engine.
